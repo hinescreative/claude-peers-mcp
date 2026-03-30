@@ -7,22 +7,23 @@ Fleet-wide peer discovery and messaging for Claude Code.
 Run Claude Code across multiple machines? `claude-peers` lets every instance find and talk to every other instance — across terminals, projects, and machines. Messages arrive instantly via [MCP channels](https://modelcontextprotocol.io).
 
 ```
-  Machine A (laptop)                   Machine B (server)
-  ┌───────────────────────┐            ┌──────────────────────┐
-  │ Claude session        │            │ Claude session       │
-  │ "send a message to    │  ───────>  │                      │
-  │  peer abc on server:  │            │ <channel> arrives    │
-  │  what files are you   │  <───────  │  instantly, Claude   │
-  │  editing?"            │            │  responds            │
-  └───────────────────────┘            └──────────────────────┘
-                     │                        │
-                     └────────┐  ┌────────────┘
-                              ▼  ▼
-                    ┌──────────────────────┐
-                    │  Central Broker      │
-                    │  SQLite + HTTP       │
-                    │  (any machine)       │
-                    └──────────────────────┘
+  Laptop                  Desktop                  Autonomous Node
+  ┌──────────────┐       ┌──────────────┐         ┌──────────────┐
+  │ Claude ×2    │       │ Claude ×1    │         │ Claude ×1    │
+  │ (two tabs)   │       │              │         │ (headless)   │
+  └──────┬───────┘       └──────┬───────┘         └──────┬───────┘
+         │                      │                        │
+         └──────────────┬───────┴────────────────────────┘
+                        ▼
+              ┌──────────────────────┐
+              │  Central Broker      │
+              │  Always-on server    │
+              │  SQLite + HTTP       │
+              │  :7899               │
+              └──────────────────────┘
+                        │
+              All peers visible to all.
+              Any session can message any other.
 ```
 
 ## How it works
@@ -114,13 +115,19 @@ Start Claude Code normally. The MCP server connects to the broker automatically.
 ## Architecture
 
 ```
-  Machine A                Machine B                Broker Host
+  Laptop (macOS)           Desktop (Windows)        Server (Linux)
   ┌──────────┐            ┌──────────┐            ┌──────────────────┐
-  │ Claude   │            │ Claude   │            │ Broker daemon    │
+  │ Claude A │            │ Claude C │            │ Broker daemon    │
   │  ↕       │            │  ↕       │            │ 0.0.0.0:7899     │
-  │ MCP srv  │───────────>│ MCP srv  │───────────>│ SQLite + HTTP    │
-  │ (stdio)  │<───────────│ (stdio)  │<───────────│                  │
-  └──────────┘            └──────────┘            └──────────────────┘
+  │ MCP srv  │──────┐     │ MCP srv  │──────┐     │ SQLite + HTTP    │
+  │ (stdio)  │      │     │ (stdio)  │      │     │                  │
+  ├──────────┤      │     └──────────┘      │     │ Also runs Claude │
+  │ Claude B │      ├────────────────────────┼────>│  ↕               │
+  │  ↕       │      │                       │     │ MCP srv D        │
+  │ MCP srv  │──────┘                       └────>│                  │
+  │ (stdio)  │                                    └──────────────────┘
+  └──────────┘
+         Multiple sessions per machine. All route through one broker.
 ```
 
 | File | Role |
