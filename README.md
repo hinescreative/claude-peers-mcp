@@ -1,8 +1,8 @@
 # claude-peers
 
-Fleet-wide peer discovery and messaging for Claude Code.
+_Originally created by [louislva](https://github.com/louislva/claude-peers-mcp). This fork adds fleet-wide federation._
 
-> Forked from [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) — the original single-machine peer discovery system. This fork extends it with cross-machine federation, token auth, and fleet-wide routing.
+Fleet-wide peer discovery and messaging for Claude Code.
 
 Run Claude Code across multiple machines? `claude-peers` lets every instance find and talk to every other instance — across terminals, projects, and machines. Messages arrive instantly via [MCP channels](https://modelcontextprotocol.io).
 
