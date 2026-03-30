@@ -7,6 +7,7 @@ export interface Peer {
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  machine: string;
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
@@ -28,6 +29,7 @@ export interface RegisterRequest {
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  machine: string;
   summary: string;
 }
 
@@ -45,10 +47,11 @@ export interface SetSummaryRequest {
 }
 
 export interface ListPeersRequest {
-  scope: "machine" | "directory" | "repo";
+  scope: "machine" | "directory" | "repo" | "fleet";
   // The requesting peer's context (used for filtering)
   cwd: string;
   git_root: string | null;
+  machine?: string;
   exclude_id?: PeerId;
 }
 
