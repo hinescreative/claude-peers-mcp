@@ -40,6 +40,12 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BROKER_PORT}`;
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
 const MACHINE_NAME = process.env.CLAUDE_PEERS_MACHINE ?? require("os").hostname();
+const CHANNEL_DISABLED = process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "1" ||
+  process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "true";
+const CHANNEL_RESPONSE_DELAY_MS = Math.max(
+  0,
+  parseInt(process.env.CLAUDE_PEERS_RESPONSE_DELAY_MS ?? "0", 10) || 0
+);
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
@@ -113,6 +119,10 @@ function log(msg: string) {
   console.error(`[claude-peers] ${msg}`);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
     const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
@@ -163,7 +173,7 @@ const mcp = new Server(
   { name: "claude-peers", version: "0.2.0" },
   {
     capabilities: {
-      experimental: { "claude/channel": {} },
+      ...(CHANNEL_DISABLED ? {} : { experimental: { "claude/channel": {} } }),
       tools: {},
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances across the fleet can see you and send you messages.
@@ -473,23 +483,29 @@ async function pollAndPushMessages() {
         sent_at: msg.sent_at,
       });
 
-      // Push as channel notification (may silently fail if channels not enabled)
-      try {
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: msg.text,
-            meta: {
-              from_id: msg.from_id,
-              from_summary: fromSummary,
-              from_cwd: fromCwd,
-              from_machine: fromMachine,
-              sent_at: msg.sent_at,
+      if (!CHANNEL_DISABLED) {
+        if (CHANNEL_RESPONSE_DELAY_MS > 0) {
+          await sleep(CHANNEL_RESPONSE_DELAY_MS);
+        }
+
+        // Push as channel notification (may silently fail if channels not enabled)
+        try {
+          await mcp.notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: msg.text,
+              meta: {
+                from_id: msg.from_id,
+                from_summary: fromSummary,
+                from_cwd: fromCwd,
+                from_machine: fromMachine,
+                sent_at: msg.sent_at,
+              },
             },
-          },
-        });
-      } catch {
-        // Channel push failed — message is still in local buffer
+          });
+        } catch {
+          // Channel push failed — message is still in local buffer
+        }
       }
 
       log(`Pushed message from ${msg.from_id} (${fromMachine}): ${msg.text.slice(0, 80)}`);

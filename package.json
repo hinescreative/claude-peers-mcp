@@ -5,8 +5,10 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "broker": "bun broker.ts",
+    "codex-server": "bun codex-server.ts",
     "server": "bun server.ts",
     "test": "bun test"
   },

@@ -95,6 +95,12 @@ Add to `~/.claude/settings.json`:
 
 This allows incoming peer messages to interrupt the session in real time. Without it, messages still arrive but require manually calling `check_messages`.
 
+If several peers are active and Claude starts returning temporary server-side rate-limit errors, set `CLAUDE_PEERS_RESPONSE_DELAY_MS` to delay inbound channel notifications:
+
+```bash
+CLAUDE_PEERS_RESPONSE_DELAY_MS=30000 claude --dangerously-load-development-channels server:claude-peers
+```
+
 ### 5. Use it
 
 Start Claude Code normally. The MCP server connects to the broker automatically.
@@ -111,6 +117,38 @@ Start Claude Code normally. The MCP server connects to the broker automatically.
 | `send_message` | Send a message to another instance by peer ID. Arrives instantly via channel push |
 | `set_summary` | Set a 1-2 sentence summary of current work, visible to other peers |
 | `check_messages` | Manually check for messages (fallback when channels aren't enabled) |
+
+## Codex peer
+
+Codex can join the same broker with the sibling MCP server:
+
+```bash
+codex mcp add codex-peers -- /Users/wesleyhines/.bun/bin/bun /Users/wesleyhines/mcp-servers/claude-peers-mcp/codex-server.ts
+```
+
+If the broker is remote or authenticated, pass the same environment variables used by Claude peers:
+
+```bash
+codex mcp add codex-peers \
+  --env CLAUDE_PEERS_BROKER_URL=http://100.69.233.7:7899 \
+  --env CLAUDE_PEERS_TOKEN=... \
+  --env CODEX_PEER_NAME=codex-main \
+  -- /Users/wesleyhines/.bun/bin/bun /Users/wesleyhines/mcp-servers/claude-peers-mcp/codex-server.ts
+```
+
+Codex tools:
+
+| Tool | Description |
+|------|-------------|
+| `peer_status` | Show Codex's peer ID, broker URL, machine, cwd, git root, and summary |
+| `list_peers` | Find Claude/Codex peers. Scopes: `fleet`, `machine`, `directory`, or `repo` |
+| `send_message` | Send a message to another peer by ID |
+| `set_summary` | Describe what this Codex peer is doing |
+| `check_messages` | Poll Codex's peer inbox |
+
+Codex does not currently receive Claude's `claude/channel` push notifications. It participates by polling with `check_messages`, then replying with `send_message`.
+
+If `CLAUDE_PEERS_BROKER_URL` or `CLAUDE_PEERS_TOKEN` are not set in Codex's MCP config, `codex-server.ts` will try to inherit them from the existing `claude-peers` entry in `~/.mcp.json`. This keeps Codex pointed at the same fleet broker without duplicating the token into `~/.codex/config.toml`.
 
 ## Architecture
 
