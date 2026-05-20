@@ -63,6 +63,10 @@ const BROKER_URL =
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? INHERITED_ENV.CLAUDE_PEERS_TOKEN ?? "";
 const MACHINE_NAME = process.env.CLAUDE_PEERS_MACHINE ?? INHERITED_ENV.CLAUDE_PEERS_MACHINE ?? require("os").hostname();
 const CODEX_PEER_NAME = process.env.CODEX_PEER_NAME ?? "codex";
+let myNickname = process.env.CODEX_PEER_NICKNAME ?? CODEX_PEER_NAME;
+let myContextWindow = parseOptionalInt(process.env.CODEX_PEER_CONTEXT_WINDOW ?? process.env.CLAUDE_PEERS_CONTEXT_WINDOW);
+let myContextUsed = parseOptionalInt(process.env.CODEX_PEER_CONTEXT_USED ?? process.env.CLAUDE_PEERS_CONTEXT_USED);
+let myContextNote = process.env.CODEX_PEER_CONTEXT_NOTE ?? process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
@@ -75,6 +79,32 @@ let myTty: string | null = null;
 let mySummary =
   process.env.CODEX_PEER_SUMMARY ??
   "Codex peer: pragmatic coding/review agent reachable through the claude-peers broker.";
+
+function stableIdPart(value: string): string {
+  let hash = 2166136261;
+  for (const ch of value) {
+    hash ^= ch.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function parseOptionalInt(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(num) && num >= 0 ? num : null;
+}
+
+function formatContext(peer: Pick<Peer, "context_window" | "context_used" | "context_note">): string {
+  const note = peer.context_note ? ` (${peer.context_note})` : "";
+  if (peer.context_window && peer.context_used !== null && peer.context_used !== undefined) {
+    return `${peer.context_used}/${peer.context_window} tokens${note}`;
+  }
+  if (peer.context_window) {
+    return `${peer.context_window} token window${note}`;
+  }
+  return peer.context_note || "unknown";
+}
 
 function log(msg: string) {
   console.error(`[codex-peers] ${msg}`);
@@ -167,7 +197,13 @@ async function peerContext() {
   return {
     id: myId,
     name: CODEX_PEER_NAME,
+    nickname: myNickname,
+    context_window: myContextWindow,
+    context_used: myContextUsed,
+    context_note: myContextNote,
     machine: MACHINE_NAME,
+    pid: process.pid,
+    tty: myTty,
     cwd: myCwd,
     git_root: myGitRoot,
     broker_url: BROKER_URL,
@@ -176,13 +212,19 @@ async function peerContext() {
 }
 
 async function registerPeer(): Promise<void> {
+  const stableId = process.env.CODEX_PEER_ID ?? `codex-${MACHINE_NAME}-${CODEX_PEER_NAME}-${stableIdPart(myCwd)}`;
   const reg = await brokerFetch<RegisterResponse>("/register", {
+    requested_id: stableId,
+    nickname: myNickname,
+    context_window: myContextWindow,
+    context_used: myContextUsed,
+    context_note: myContextNote,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty: myTty,
     machine: MACHINE_NAME,
-    summary: `[${CODEX_PEER_NAME}] ${mySummary}`,
+    summary: mySummary,
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
@@ -220,7 +262,7 @@ const mcp = new Server(
     capabilities: { tools: {} },
     instructions: `You are connected to the claude-peers network as a Codex peer.
 
-Use list_peers to discover Claude peers, check_messages to read incoming peer messages, send_message to reply, and set_summary to keep your fleet status useful.
+Use peer_status to see your own stable ID, list_peers to discover Claude peers, check_messages to read incoming peer messages, send_message to reply, set_nickname to label yourself, set_context to publish context-window metadata, and set_summary to keep your fleet status useful.
 
 Codex does not receive Claude channel push notifications. You must explicitly call check_messages when you want to poll the peer inbox.`,
   }
@@ -282,6 +324,41 @@ const TOOLS = [
     },
   },
   {
+    name: "set_nickname",
+    description: "Set this Codex peer's visible nickname.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        nickname: {
+          type: "string" as const,
+          description: "Short human-readable name visible beside this peer ID.",
+        },
+      },
+      required: ["nickname"],
+    },
+  },
+  {
+    name: "set_context",
+    description: "Set this Codex peer's visible context-window metadata.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        context_window: {
+          type: "number" as const,
+          description: "Maximum context window in tokens, if known.",
+        },
+        context_used: {
+          type: "number" as const,
+          description: "Approximate used context tokens, if known.",
+        },
+        context_note: {
+          type: "string" as const,
+          description: "Short note such as model alias, 1M context, or unknown.",
+        },
+      },
+    },
+  },
+  {
     name: "set_summary",
     description: "Set this Codex peer's visible fleet summary.",
     inputSchema: {
@@ -332,7 +409,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       const lines = peers.map((p) => {
-        const parts = [`ID: ${p.id}`, `Machine: ${p.machine}`, `PID: ${p.pid}`, `CWD: ${p.cwd}`];
+        const parts = [
+          `ID: ${p.id}`,
+          `Name: ${p.nickname || "(none)"}`,
+          `Context: ${formatContext(p)}`,
+          `Machine: ${p.machine}`,
+          `PID: ${p.pid}`,
+          `CWD: ${p.cwd}`,
+        ];
         if (p.git_root) parts.push(`Repo: ${p.git_root}`);
         if (p.tty) parts.push(`TTY: ${p.tty}`);
         if (p.summary) parts.push(`Summary: ${p.summary}`);
@@ -378,6 +462,51 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    case "set_nickname": {
+      const { nickname } = args as { nickname: string };
+      myNickname = nickname.trim().slice(0, 64);
+      await ensureRegistered();
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet." }],
+          isError: true,
+        };
+      }
+
+      await brokerFetch("/set-nickname", { id: myId, nickname: myNickname });
+      return {
+        content: [{ type: "text" as const, text: `Nickname updated: "${myNickname}"` }],
+      };
+    }
+
+    case "set_context": {
+      const input = args as {
+        context_window?: number | null;
+        context_used?: number | null;
+        context_note?: string;
+      };
+      myContextWindow = parseOptionalInt(input.context_window);
+      myContextUsed = parseOptionalInt(input.context_used);
+      myContextNote = (input.context_note ?? "").trim().slice(0, 120);
+      await ensureRegistered();
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet." }],
+          isError: true,
+        };
+      }
+
+      await brokerFetch("/set-context", {
+        id: myId,
+        context_window: myContextWindow,
+        context_used: myContextUsed,
+        context_note: myContextNote,
+      });
+      return {
+        content: [{ type: "text" as const, text: `Context updated: ${formatContext({ context_window: myContextWindow, context_used: myContextUsed, context_note: myContextNote })}` }],
+      };
+    }
+
     case "check_messages": {
       await ensureRegistered();
       if (!myId) {
@@ -404,7 +533,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const lines = result.messages.map((m) => {
         const sender = byId.get(m.from_id);
         const label = sender
-          ? `${m.from_id} [${sender.machine}] ${sender.summary || sender.cwd}`
+          ? `${m.from_id}${sender.nickname ? ` (${sender.nickname})` : ""} [${sender.machine}] ${sender.summary || sender.cwd}`
           : m.from_id;
         return `From ${label} (${m.sent_at}):\n${m.text}`;
       });
@@ -469,14 +598,9 @@ async function main() {
 
   const cleanup = async () => {
     clearInterval(heartbeatTimer);
-    if (myId) {
-      try {
-        await brokerFetch("/unregister", { id: myId });
-        log("Unregistered from broker");
-      } catch {
-        // Best effort.
-      }
-    }
+    // Keep the stable Codex peer row in the broker so Claude peers can reply
+    // between short-lived MCP process restarts. The next Codex process reuses
+    // the same ID and polls any queued messages.
     process.exit(0);
   };
 

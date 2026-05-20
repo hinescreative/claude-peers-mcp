@@ -40,6 +40,10 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BROKER_PORT}`;
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
 const MACHINE_NAME = process.env.CLAUDE_PEERS_MACHINE ?? require("os").hostname();
+const DEFAULT_NICKNAME = process.env.CLAUDE_PEERS_NICKNAME ?? process.env.CLAUDE_PEER_NAME ?? "";
+const DEFAULT_CONTEXT_WINDOW = parseOptionalInt(process.env.CLAUDE_PEERS_CONTEXT_WINDOW);
+const DEFAULT_CONTEXT_USED = parseOptionalInt(process.env.CLAUDE_PEERS_CONTEXT_USED);
+const DEFAULT_CONTEXT_NOTE = process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const CHANNEL_DISABLED = process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "1" ||
   process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "true";
 const CHANNEL_RESPONSE_DELAY_MS = Math.max(
@@ -49,6 +53,7 @@ const CHANNEL_RESPONSE_DELAY_MS = Math.max(
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const START_PARENT_PID = process.ppid;
 
 // Detect if broker is local (only auto-launch local brokers)
 const isLocalBroker = BROKER_URL.includes("127.0.0.1") || BROKER_URL.includes("localhost");
@@ -123,6 +128,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function parseOptionalInt(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(num) && num >= 0 ? num : null;
+}
+
+function formatContext(peer: Pick<Peer, "context_window" | "context_used" | "context_note">): string {
+  const note = peer.context_note ? ` (${peer.context_note})` : "";
+  if (peer.context_window && peer.context_used !== null && peer.context_used !== undefined) {
+    return `${peer.context_used}/${peer.context_window} tokens${note}`;
+  }
+  if (peer.context_window) {
+    return `${peer.context_window} token window${note}`;
+  }
+  return peer.context_note || "unknown";
+}
+
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
     const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
@@ -157,11 +179,28 @@ function getTty(): string | null {
   return null;
 }
 
+function parentProcessChanged(): boolean {
+  if (!START_PARENT_PID || START_PARENT_PID === 1) return false;
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
+    const currentParent = Number(new TextDecoder().decode(proc.stdout).trim());
+    return Number.isInteger(currentParent) && currentParent !== START_PARENT_PID;
+  } catch {
+    return false;
+  }
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myTty: string | null = null;
+let myNickname = DEFAULT_NICKNAME;
+let myContextWindow: number | null = DEFAULT_CONTEXT_WINDOW;
+let myContextUsed: number | null = DEFAULT_CONTEXT_USED;
+let myContextNote = DEFAULT_CONTEXT_NOTE;
+let mySummary = "";
 
 // Local message buffer — messages consumed by poll loop are kept here
 // so check_messages can still return them if channel push failed silently
@@ -183,8 +222,11 @@ IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPO
 Read the from_id, from_summary, from_cwd, and from_machine attributes to understand who sent the message and which machine they're on. Reply by calling send_message with their from_id.
 
 Available tools:
+- peer_status: Show this instance's own peer ID, nickname, broker, cwd, and summary
 - list_peers: Discover other Claude Code instances (scope: fleet/machine/directory/repo)
 - send_message: Send a message to another instance by ID
+- set_nickname: Set a short human-readable name for this instance
+- set_context: Set this instance's context window metadata
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
 
@@ -196,9 +238,17 @@ When you start, proactively call set_summary to describe what you're working on.
 
 const TOOLS = [
   {
+    name: "peer_status",
+    description: "Show this Claude peer's registration, nickname, broker, machine, cwd, and summary.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
     name: "list_peers",
     description:
-      "List other Claude Code instances. Returns their ID, working directory, git repo, machine name, and summary.",
+      "List Claude/Codex peers. Returns their ID, nickname, working directory, git repo, machine name, and summary.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -207,6 +257,10 @@ const TOOLS = [
           enum: ["fleet", "machine", "directory", "repo"],
           description:
             'Scope of peer discovery. "fleet" = all instances across all machines. "machine" = instances on the same machine. "directory" = same working directory. "repo" = same git repository.',
+        },
+        include_self: {
+          type: "boolean" as const,
+          description: "Include this Claude peer in the result.",
         },
       },
       required: ["scope"],
@@ -229,6 +283,43 @@ const TOOLS = [
         },
       },
       required: ["to_id", "message"],
+    },
+  },
+  {
+    name: "set_nickname",
+    description:
+      "Set a short human-readable nickname for this peer. The nickname is visible in list_peers next to the stable peer ID.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        nickname: {
+          type: "string" as const,
+          description: "Short name for this peer, for example repo-lead, review-pane, or mac-codex.",
+        },
+      },
+      required: ["nickname"],
+    },
+  },
+  {
+    name: "set_context",
+    description:
+      "Set context window metadata for this peer. Use context_window for max tokens, context_used when known, and context_note for model/context notes. Unknown values should be omitted.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        context_window: {
+          type: "number" as const,
+          description: "Maximum context window in tokens, if known.",
+        },
+        context_used: {
+          type: "number" as const,
+          description: "Approximate used context tokens, if known.",
+        },
+        context_note: {
+          type: "string" as const,
+          description: "Short note such as model alias, 1M context, or unknown.",
+        },
+      },
     },
   },
   {
@@ -267,15 +358,46 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
   switch (name) {
+    case "peer_status": {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                id: myId,
+                nickname: myNickname,
+                context_window: myContextWindow,
+                context_used: myContextUsed,
+                context_note: myContextNote,
+                machine: MACHINE_NAME,
+                pid: process.pid,
+                tty: myTty,
+                cwd: myCwd,
+                git_root: myGitRoot,
+                broker_url: BROKER_URL,
+                summary: mySummary,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
     case "list_peers": {
-      const scope = (args as { scope: string }).scope as "fleet" | "machine" | "directory" | "repo";
+      const { scope, include_self } = args as {
+        scope: "fleet" | "machine" | "directory" | "repo";
+        include_self?: boolean;
+      };
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope,
           cwd: myCwd,
           git_root: myGitRoot,
           machine: MACHINE_NAME,
-          exclude_id: myId,
+          exclude_id: include_self ? undefined : myId,
         });
 
         if (peers.length === 0) {
@@ -292,6 +414,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = peers.map((p) => {
           const parts = [
             `ID: ${p.id}`,
+            `Name: ${p.nickname || "(none)"}`,
+            `Context: ${formatContext(p)}`,
             `Machine: ${p.machine}`,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
@@ -317,6 +441,71 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error listing peers: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "set_nickname": {
+      const { nickname } = args as { nickname: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      myNickname = nickname.trim().slice(0, 64);
+      try {
+        await brokerFetch("/set-nickname", { id: myId, nickname: myNickname });
+        return {
+          content: [{ type: "text" as const, text: `Nickname updated: "${myNickname}"` }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error setting nickname: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "set_context": {
+      const input = args as {
+        context_window?: number | null;
+        context_used?: number | null;
+        context_note?: string;
+      };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      myContextWindow = parseOptionalInt(input.context_window);
+      myContextUsed = parseOptionalInt(input.context_used);
+      myContextNote = (input.context_note ?? "").trim().slice(0, 120);
+      try {
+        await brokerFetch("/set-context", {
+          id: myId,
+          context_window: myContextWindow,
+          context_used: myContextUsed,
+          context_note: myContextNote,
+        });
+        return {
+          content: [{ type: "text" as const, text: `Context updated: ${formatContext({ context_window: myContextWindow, context_used: myContextUsed, context_note: myContextNote })}` }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error setting context: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,
@@ -362,6 +551,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "set_summary": {
       const { summary } = args as { summary: string };
+      mySummary = summary;
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -525,8 +715,10 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  myTty = tty;
 
   log(`Machine: ${MACHINE_NAME}`);
+  log(`Nickname: ${myNickname || "(none)"}`);
   log(`Broker: ${BROKER_URL}`);
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
@@ -558,6 +750,10 @@ async function main() {
 
   // 4. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {
+    nickname: myNickname,
+    context_window: myContextWindow,
+    context_used: myContextUsed,
+    context_note: myContextNote,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
@@ -566,6 +762,7 @@ async function main() {
     summary: initialSummary,
   });
   myId = reg.id;
+  mySummary = initialSummary;
   log(`Registered as peer ${myId} on machine ${MACHINE_NAME}`);
 
   // If summary generation is still running, update it when done
@@ -574,6 +771,7 @@ async function main() {
       if (initialSummary && myId) {
         try {
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
+          mySummary = initialSummary;
           log(`Late auto-summary applied: ${initialSummary}`);
         } catch {
           // Non-critical
@@ -593,6 +791,11 @@ async function main() {
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
+        if (parentProcessChanged()) {
+          log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned MCP server`);
+          await cleanup();
+          return;
+        }
         await brokerFetch("/heartbeat", { id: myId });
       } catch {
         // Non-critical

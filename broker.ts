@@ -18,6 +18,8 @@ import type {
   RegisterResponse,
   HeartbeatRequest,
   SetSummaryRequest,
+  SetNicknameRequest,
+  SetContextRequest,
   ListPeersRequest,
   SendMessageRequest,
   PollMessagesRequest,
@@ -29,8 +31,16 @@ import type {
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
+const REQUIRE_AUTH =
+  process.env.CLAUDE_PEERS_REQUIRE_AUTH === "1" ||
+  process.env.CLAUDE_PEERS_REQUIRE_AUTH === "true";
+const TTL_MINUTES = parseInt(process.env.CLAUDE_PEERS_TTL_MINUTES ?? "20", 10);
+const STALE_PEER_MS = Math.max(1, Number.isFinite(TTL_MINUTES) ? TTL_MINUTES : 20) * 60 * 1000;
 
-if (!AUTH_TOKEN) {
+if (REQUIRE_AUTH && !AUTH_TOKEN) {
+  console.error("[claude-peers broker] FATAL: CLAUDE_PEERS_REQUIRE_AUTH is set but CLAUDE_PEERS_TOKEN is empty.");
+  process.exit(1);
+} else if (!AUTH_TOKEN) {
   console.error("[claude-peers broker] WARNING: No CLAUDE_PEERS_TOKEN set. Broker is unauthenticated.");
 }
 
@@ -48,6 +58,10 @@ db.run(`
     git_root TEXT,
     tty TEXT,
     machine TEXT NOT NULL DEFAULT 'unknown',
+    nickname TEXT NOT NULL DEFAULT '',
+    context_window INTEGER,
+    context_used INTEGER,
+    context_note TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
@@ -57,6 +71,30 @@ db.run(`
 // Migrate: add machine column if it doesn't exist (for upgrades from pre-federation)
 try {
   db.run("ALTER TABLE peers ADD COLUMN machine TEXT NOT NULL DEFAULT 'unknown'");
+} catch {
+  // Column already exists
+}
+
+// Migrate: add nickname column if it doesn't exist
+try {
+  db.run("ALTER TABLE peers ADD COLUMN nickname TEXT NOT NULL DEFAULT ''");
+} catch {
+  // Column already exists
+}
+
+// Migrate: add context metadata columns if they don't exist
+try {
+  db.run("ALTER TABLE peers ADD COLUMN context_window INTEGER");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN context_used INTEGER");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN context_note TEXT NOT NULL DEFAULT ''");
 } catch {
   // Column already exists
 }
@@ -74,7 +112,22 @@ db.run(`
   )
 `);
 
-// Clean up stale peers on startup — for local peers, check PID; for remote, use last_seen
+function deletePeerAndUndeliveredMessages(id: string): void {
+  db.run("DELETE FROM peers WHERE id = ?", [id]);
+  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+}
+
+function peerIsStale(peer: Pick<Peer, "last_seen">): boolean {
+  const lastSeen = new Date(peer.last_seen).getTime();
+  return !Number.isFinite(lastSeen) || Date.now() - lastSeen > STALE_PEER_MS;
+}
+
+function touchPeer(id: string): void {
+  updateLastSeen.run(new Date().toISOString(), id);
+}
+
+// Clean up stale peers on startup and before broker operations. Local host peers
+// get a PID check; all peers are also bounded by last_seen TTL.
 function cleanStalePeers() {
   const hostname = require("os").hostname();
   const peers = db.query("SELECT id, pid, machine, last_seen FROM peers").all() as {
@@ -85,20 +138,17 @@ function cleanStalePeers() {
   }[];
 
   for (const peer of peers) {
+    if (peerIsStale(peer)) {
+      deletePeerAndUndeliveredMessages(peer.id);
+      continue;
+    }
+
     if (peer.machine === hostname) {
       // Local peer — check if PID is alive
       try {
         process.kill(peer.pid, 0);
       } catch {
-        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-      }
-    } else {
-      // Remote peer — expire if no heartbeat for 5 minutes
-      const staleMs = Date.now() - new Date(peer.last_seen).getTime();
-      if (staleMs > 5 * 60 * 1000) {
-        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+        deletePeerAndUndeliveredMessages(peer.id);
       }
     }
   }
@@ -124,8 +174,8 @@ function checkAuth(req: Request): Response | null {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, nickname, context_window, context_used, context_note, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -134,6 +184,14 @@ const updateLastSeen = db.prepare(`
 
 const updateSummary = db.prepare(`
   UPDATE peers SET summary = ? WHERE id = ?
+`);
+
+const updateNickname = db.prepare(`
+  UPDATE peers SET nickname = ? WHERE id = ?
+`);
+
+const updateContext = db.prepare(`
+  UPDATE peers SET context_window = ?, context_used = ?, context_note = ? WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -180,12 +238,44 @@ function generateId(): string {
   return id;
 }
 
+function normalizeRequestedId(id: unknown): string | null {
+  if (typeof id !== "string") return null;
+  const trimmed = id.trim();
+  return /^[a-zA-Z0-9_-]{3,64}$/.test(trimmed) ? trimmed : null;
+}
+
+function normalizeNickname(nickname: unknown): string {
+  if (typeof nickname !== "string") return "";
+  return nickname.trim().slice(0, 64);
+}
+
+function normalizeOptionalInt(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(num) && num >= 0 ? num : null;
+}
+
+function normalizeContextNote(note: unknown): string {
+  if (typeof note !== "string") return "";
+  return note.trim().slice(0, 120);
+}
+
 // --- Request handlers ---
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
-  const id = generateId();
+  cleanStalePeers();
+
+  const id = normalizeRequestedId(body.requested_id) ?? generateId();
+  const nickname = normalizeNickname(body.nickname);
+  const contextWindow = normalizeOptionalInt(body.context_window);
+  const contextUsed = normalizeOptionalInt(body.context_used);
+  const contextNote = normalizeContextNote(body.context_note);
   const now = new Date().toISOString();
   const machine = body.machine || "unknown";
+
+  // Stable IDs are used by clients with short-lived MCP server processes
+  // (notably Codex) so replies can target the same inbox across restarts.
+  deletePeer.run(id);
 
   // Remove any existing registration for this PID + machine combo (re-registration)
   const existing = db
@@ -195,19 +285,48 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, machine, body.summary, now, now);
+  insertPeer.run(
+    id,
+    nickname,
+    contextWindow,
+    contextUsed,
+    contextNote,
+    body.pid,
+    body.cwd,
+    body.git_root,
+    body.tty,
+    machine,
+    body.summary,
+    now,
+    now
+  );
   return { id };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+  touchPeer(body.id);
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
+function handleSetNickname(body: SetNicknameRequest): void {
+  updateNickname.run(normalizeNickname(body.nickname), body.id);
+}
+
+function handleSetContext(body: SetContextRequest): void {
+  updateContext.run(
+    normalizeOptionalInt(body.context_window),
+    normalizeOptionalInt(body.context_used),
+    normalizeContextNote(body.context_note),
+    body.id
+  );
+}
+
 function handleListPeers(body: ListPeersRequest): Peer[] {
+  cleanStalePeers();
+
   let peers: Peer[];
 
   switch (body.scope) {
@@ -244,12 +363,17 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   // For local peers, verify process is still alive
   const hostname = require("os").hostname();
   return peers.filter((p) => {
+    if (peerIsStale(p)) {
+      deletePeerAndUndeliveredMessages(p.id);
+      return false;
+    }
+
     if (p.machine === hostname) {
       try {
         process.kill(p.pid, 0);
         return true;
       } catch {
-        deletePeer.run(p.id);
+        deletePeerAndUndeliveredMessages(p.id);
         return false;
       }
     }
@@ -259,10 +383,19 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+  cleanStalePeers();
+  touchPeer(body.from_id);
+
   // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  const target = db.query("SELECT id, last_seen FROM peers WHERE id = ?").get(body.to_id) as
+    | Pick<Peer, "id" | "last_seen">
+    | null;
   if (!target) {
     return { ok: false, error: `Peer ${body.to_id} not found` };
+  }
+  if (peerIsStale(target)) {
+    deletePeerAndUndeliveredMessages(target.id);
+    return { ok: false, error: `Peer ${body.to_id} is stale` };
   }
 
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
@@ -270,6 +403,7 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+  touchPeer(body.id);
   const messages = selectUndelivered.all(body.id) as Message[];
 
   // Mark them as delivered
@@ -316,6 +450,12 @@ Bun.serve({
           return Response.json({ ok: true });
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
+          return Response.json({ ok: true });
+        case "/set-nickname":
+          handleSetNickname(body as SetNicknameRequest);
+          return Response.json({ ok: true });
+        case "/set-context":
+          handleSetContext(body as SetContextRequest);
           return Response.json({ ok: true });
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));

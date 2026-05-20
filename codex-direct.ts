@@ -114,11 +114,15 @@ function usage(): never {
   console.error(`Usage:
   bun codex-direct.ts status
   bun codex-direct.ts peers
+  bun codex-direct.ts poll [peer-id]
+  bun codex-direct.ts send <to-peer-id> <message> [--from peer-id]
   bun codex-direct.ts ask <peer-id> <message> [--seconds 120]
 
 Notes:
   - Loads broker URL/token from ~/.mcp.json or env.
   - Does not print broker tokens.
+  - poll reads and marks delivered for the selected peer ID.
+  - send defaults to a temporary direct peer unless --from is provided.
   - ask registers a temporary Codex peer and polls for replies.`);
   process.exit(2);
 }
@@ -138,6 +142,37 @@ if (cmd === "status") {
   for (const p of peers) {
     const summary = p.summary ? ` — ${p.summary}` : "";
     console.log(`${p.id} [${p.machine}] ${p.cwd}${summary}`);
+  }
+} else if (cmd === "poll") {
+  const id = args[0] ?? process.env.CODEX_PEER_ID;
+  if (!id) usage();
+  const result = await brokerFetch<{ messages: Message[] }>("/poll-messages", { id });
+  if (result.messages.length === 0) {
+    console.log(`No new messages for ${id}.`);
+  } else {
+    for (const msg of result.messages) {
+      console.log(`\nfrom ${msg.from_id} at ${msg.sent_at}:\n${msg.text}`);
+    }
+  }
+} else if (cmd === "send") {
+  const fromFlag = args.indexOf("--from");
+  const fromId = fromFlag >= 0 ? args[fromFlag + 1] : null;
+  const messageEnd = fromFlag >= 0 ? fromFlag : args.length;
+  const toId = args[0];
+  const message = args.slice(1, messageEnd).join(" ").trim();
+  if (!toId || !message || (fromFlag >= 0 && !fromId)) usage();
+
+  const id = fromId ?? (await register("codex-direct fallback: temporary Codex peer sending a message."));
+  try {
+    const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+      from_id: id,
+      to_id: toId,
+      text: message,
+    });
+    if (!result.ok) throw new Error(result.error ?? "send failed");
+    console.log(`sent from ${id} to ${toId}`);
+  } finally {
+    if (!fromId) await unregister(id);
   }
 } else if (cmd === "ask") {
   const toId = args[0];

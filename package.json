@@ -8,6 +8,7 @@
   "license": "MIT",
   "scripts": {
     "broker": "bun broker.ts",
+    "dashboard": "bun dashboard-server.ts",
     "codex-server": "bun codex-server.ts",
     "server": "bun server.ts",
     "test": "bun test"

@@ -3,6 +3,10 @@ export type PeerId = string;
 
 export interface Peer {
   id: PeerId;
+  nickname: string;
+  context_window: number | null;
+  context_used: number | null;
+  context_note: string;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -25,6 +29,11 @@ export interface Message {
 // --- Broker API types ---
 
 export interface RegisterRequest {
+  requested_id?: string;
+  nickname?: string;
+  context_window?: number | null;
+  context_used?: number | null;
+  context_note?: string;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -44,6 +53,18 @@ export interface HeartbeatRequest {
 export interface SetSummaryRequest {
   id: PeerId;
   summary: string;
+}
+
+export interface SetNicknameRequest {
+  id: PeerId;
+  nickname: string;
+}
+
+export interface SetContextRequest {
+  id: PeerId;
+  context_window?: number | null;
+  context_used?: number | null;
+  context_note?: string;
 }
 
 export interface ListPeersRequest {
