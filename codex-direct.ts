@@ -91,7 +91,12 @@ async function gitRoot(cwd: string): Promise<string | null> {
 
 async function register(summary: string): Promise<string> {
   const cwd = process.cwd();
+  const requestedId = `codex-direct-${process.pid}-${Date.now().toString(36)}`;
   const result = await brokerFetch<{ id: string }>("/register", {
+    requested_id: requestedId,
+    nickname: "codex-direct",
+    tier: "infrastructure",
+    payload_version: 1,
     pid: process.pid,
     cwd,
     git_root: await gitRoot(cwd),

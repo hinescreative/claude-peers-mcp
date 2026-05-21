@@ -7,6 +7,8 @@ export interface Peer {
   context_window: number | null;
   context_used: number | null;
   context_note: string;
+  tier: "production" | "staging" | "infrastructure";
+  payload_version: number;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -29,11 +31,13 @@ export interface Message {
 // --- Broker API types ---
 
 export interface RegisterRequest {
-  requested_id?: string;
+  requested_id: string;
   nickname?: string;
   context_window?: number | null;
   context_used?: number | null;
   context_note?: string;
+  tier?: "production" | "staging" | "infrastructure";
+  payload_version?: number;
   pid: number;
   cwd: string;
   git_root: string | null;

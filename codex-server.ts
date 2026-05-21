@@ -22,6 +22,7 @@ import type {
   PollMessagesResponse,
   RegisterResponse,
 } from "./shared/types.ts";
+import { fileURLToPath } from "node:url";
 
 type ClaudePeersEnv = {
   CLAUDE_PEERS_BROKER_URL?: string;
@@ -68,7 +69,7 @@ let myContextWindow = parseOptionalInt(process.env.CODEX_PEER_CONTEXT_WINDOW ?? 
 let myContextUsed = parseOptionalInt(process.env.CODEX_PEER_CONTEXT_USED ?? process.env.CLAUDE_PEERS_CONTEXT_USED);
 let myContextNote = process.env.CODEX_PEER_CONTEXT_NOTE ?? process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 
 const isLocalBroker = BROKER_URL.includes("127.0.0.1") || BROKER_URL.includes("localhost");
 
@@ -219,6 +220,8 @@ async function registerPeer(): Promise<void> {
     context_window: myContextWindow,
     context_used: myContextUsed,
     context_note: myContextNote,
+    tier: (process.env.CLAUDE_PEERS_TIER as "production" | "staging" | "infrastructure" | undefined) ?? "production",
+    payload_version: 1,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,

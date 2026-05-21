@@ -62,6 +62,8 @@ db.run(`
     context_window INTEGER,
     context_used INTEGER,
     context_note TEXT NOT NULL DEFAULT '',
+    tier TEXT NOT NULL DEFAULT 'production',
+    payload_version INTEGER NOT NULL DEFAULT 1,
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
@@ -95,6 +97,16 @@ try {
 }
 try {
   db.run("ALTER TABLE peers ADD COLUMN context_note TEXT NOT NULL DEFAULT ''");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN tier TEXT NOT NULL DEFAULT 'production'");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN payload_version INTEGER NOT NULL DEFAULT 1");
 } catch {
   // Column already exists
 }
@@ -174,8 +186,8 @@ function checkAuth(req: Request): Response | null {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, nickname, context_window, context_used, context_note, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, nickname, context_window, context_used, context_note, tier, payload_version, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -260,21 +272,35 @@ function normalizeContextNote(note: unknown): string {
   return note.trim().slice(0, 120);
 }
 
+function normalizeTier(tier: unknown): "production" | "staging" | "infrastructure" {
+  return tier === "staging" || tier === "infrastructure" ? tier : "production";
+}
+
+function normalizePayloadVersion(version: unknown): number {
+  const num = typeof version === "number" ? version : Number(version);
+  return Number.isInteger(num) && num > 0 ? num : 1;
+}
+
 // --- Request handlers ---
 
 function handleRegister(body: RegisterRequest): RegisterResponse {
   cleanStalePeers();
 
-  const id = normalizeRequestedId(body.requested_id) ?? generateId();
+  const id = normalizeRequestedId(body.requested_id);
+  if (!id) {
+    throw new Error("register requires requested_id");
+  }
   const nickname = normalizeNickname(body.nickname);
   const contextWindow = normalizeOptionalInt(body.context_window);
   const contextUsed = normalizeOptionalInt(body.context_used);
   const contextNote = normalizeContextNote(body.context_note);
+  const tier = normalizeTier(body.tier);
+  const payloadVersion = normalizePayloadVersion(body.payload_version);
   const now = new Date().toISOString();
   const machine = body.machine || "unknown";
 
-  // Stable IDs are used by clients with short-lived MCP server processes
-  // (notably Codex) so replies can target the same inbox across restarts.
+  // Clients own peer identity. The broker validates and records requested_id;
+  // it does not mint IDs for production registrations.
   deletePeer.run(id);
 
   // Remove any existing registration for this PID + machine combo (re-registration)
@@ -291,6 +317,8 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     contextWindow,
     contextUsed,
     contextNote,
+    tier,
+    payloadVersion,
     body.pid,
     body.cwd,
     body.git_root,
@@ -303,8 +331,9 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   return { id };
 }
 
-function handleHeartbeat(body: HeartbeatRequest): void {
-  touchPeer(body.id);
+function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; found: boolean } {
+  const result = updateLastSeen.run(new Date().toISOString(), body.id);
+  return { ok: true, found: result.changes > 0 };
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
@@ -446,8 +475,7 @@ Bun.serve({
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
         case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleHeartbeat(body as HeartbeatRequest));
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });

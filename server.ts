@@ -33,6 +33,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import { fileURLToPath } from "node:url";
 
 // --- Configuration ---
 
@@ -52,7 +53,7 @@ const CHANNEL_RESPONSE_DELAY_MS = Math.max(
 );
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 const START_PARENT_PID = process.ppid;
 
 // Detect if broker is local (only auto-launch local brokers)
@@ -101,7 +102,7 @@ async function ensureBroker(): Promise<void> {
   }
 
   log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
+  const proc = Bun.spawn([process.execPath, BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
   });
 
@@ -190,6 +191,26 @@ function parentProcessChanged(): boolean {
   }
 }
 
+function cwdBasename(cwd: string): string {
+  return cwd.split(/[\\/]/).filter(Boolean).pop() || "home";
+}
+
+function shortTty(tty: string | null): string {
+  if (!tty) return "no-tty";
+  const match = tty.match(/(\d+)$/);
+  return match ? match[1].padStart(3, "0") : tty.replace(/[^a-zA-Z0-9_-]/g, "-");
+}
+
+function stablePeerId(machine: string, cwd: string, tty: string | null): string {
+  return `${machine}-${cwdBasename(cwd)}-${shortTty(tty)}`
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .slice(0, 64);
+}
+
+function defaultNickname(machine: string, cwd: string, tty: string | null): string {
+  return `${machine}:${cwdBasename(cwd)}:${shortTty(tty)}`.slice(0, 64);
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
@@ -201,6 +222,7 @@ let myContextWindow: number | null = DEFAULT_CONTEXT_WINDOW;
 let myContextUsed: number | null = DEFAULT_CONTEXT_USED;
 let myContextNote = DEFAULT_CONTEXT_NOTE;
 let mySummary = "";
+let myRequestedId = "";
 
 // Local message buffer — messages consumed by poll loop are kept here
 // so check_messages can still return them if channel push failed silently
@@ -723,6 +745,11 @@ async function main() {
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
+  if (!myNickname) {
+    myNickname = defaultNickname(MACHINE_NAME, myCwd, tty);
+    log(`Auto-nickname: ${myNickname}`);
+  }
+  myRequestedId = process.env.CLAUDE_PEER_ID ?? stablePeerId(MACHINE_NAME, myCwd, tty);
 
   // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   let initialSummary = "";
@@ -750,10 +777,13 @@ async function main() {
 
   // 4. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {
+    requested_id: myRequestedId,
     nickname: myNickname,
     context_window: myContextWindow,
     context_used: myContextUsed,
     context_note: myContextNote,
+    tier: (process.env.CLAUDE_PEERS_TIER as "production" | "staging" | "infrastructure" | undefined) ?? "production",
+    payload_version: 1,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
@@ -796,7 +826,26 @@ async function main() {
           await cleanup();
           return;
         }
-        await brokerFetch("/heartbeat", { id: myId });
+        const heartbeat = await brokerFetch<{ ok: boolean; found?: boolean }>("/heartbeat", { id: myId });
+        if (heartbeat.found === false) {
+          const reg = await brokerFetch<RegisterResponse>("/register", {
+            requested_id: myRequestedId,
+            nickname: myNickname,
+            context_window: myContextWindow,
+            context_used: myContextUsed,
+            context_note: myContextNote,
+            tier: (process.env.CLAUDE_PEERS_TIER as "production" | "staging" | "infrastructure" | undefined) ?? "production",
+            payload_version: 1,
+            pid: process.pid,
+            cwd: myCwd,
+            git_root: myGitRoot,
+            tty: myTty,
+            machine: MACHINE_NAME,
+            summary: mySummary,
+          });
+          myId = reg.id;
+          log(`Re-registered missing peer row as ${myId}`);
+        }
       } catch {
         // Non-critical
       }
