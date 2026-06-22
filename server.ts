@@ -53,6 +53,7 @@ const CHANNEL_RESPONSE_DELAY_MS = Math.max(
 );
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const REGISTER_RETRY_MS = 5000;
 const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 const START_PARENT_PID = process.ppid;
 
@@ -223,6 +224,8 @@ let myContextUsed: number | null = DEFAULT_CONTEXT_USED;
 let myContextNote = DEFAULT_CONTEXT_NOTE;
 let mySummary = "";
 let myRequestedId = "";
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 // Local message buffer — messages consumed by poll loop are kept here
 // so check_messages can still return them if channel push failed silently
@@ -729,29 +732,32 @@ async function pollAndPushMessages() {
 
 // --- Startup ---
 
-async function main() {
-  // 1. Ensure broker is running (only auto-launch if local)
-  await ensureBroker();
-
-  // 2. Gather context
-  myCwd = process.cwd();
-  myGitRoot = await getGitRoot(myCwd);
-  const tty = getTty();
-  myTty = tty;
-
-  log(`Machine: ${MACHINE_NAME}`);
-  log(`Nickname: ${myNickname || "(none)"}`);
-  log(`Broker: ${BROKER_URL}`);
-  log(`CWD: ${myCwd}`);
-  log(`Git root: ${myGitRoot ?? "(none)"}`);
-  log(`TTY: ${tty ?? "(unknown)"}`);
-  if (!myNickname) {
-    myNickname = defaultNickname(MACHINE_NAME, myCwd, tty);
-    log(`Auto-nickname: ${myNickname}`);
+// Clean up on exit. Module-level so the heartbeat (orphan check) and the
+// SIGINT/SIGTERM handlers can all reach it. Clears whatever timers are running
+// and best-effort unregisters before exiting cleanly.
+async function cleanupAndExit(): Promise<void> {
+  if (pollTimer) clearInterval(pollTimer);
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  if (myId) {
+    try {
+      await brokerFetch("/unregister", { id: myId });
+      log("Unregistered from broker");
+    } catch {
+      // Best effort
+    }
   }
-  myRequestedId = process.env.CLAUDE_PEER_ID ?? stablePeerId(MACHINE_NAME, myCwd, tty);
+  process.exit(0);
+}
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
+// Bring up the broker connection in the BACKGROUND, after the MCP transport is
+// already connected. A slow or unreachable broker therefore never delays — or
+// kills — the harness handshake. Registration retries forever instead of
+// throwing, so a transient blip during the --continue re-init burst self-heals
+// rather than leaving a permanently-dead stdio server (Claude Code does not
+// auto-restart one). Until registration lands, tool handlers degrade gracefully
+// via their "Not registered with broker yet" guards.
+async function bringUpBroker(): Promise<void> {
+  // Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   let initialSummary = "";
   const summaryPromise = (async () => {
     try {
@@ -772,28 +778,47 @@ async function main() {
     }
   })();
 
-  // Wait briefly for summary, but don't block startup
+  // Wait briefly for summary, but don't block bring-up
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    requested_id: myRequestedId,
-    nickname: myNickname,
-    context_window: myContextWindow,
-    context_used: myContextUsed,
-    context_note: myContextNote,
-    tier: (process.env.CLAUDE_PEERS_TIER as "production" | "staging" | "infrastructure" | undefined) ?? "production",
-    payload_version: 1,
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    machine: MACHINE_NAME,
-    summary: initialSummary,
-  });
-  myId = reg.id;
-  mySummary = initialSummary;
-  log(`Registered as peer ${myId} on machine ${MACHINE_NAME}`);
+  // Auto-mesh-status Layer 1: never register blank. If the LLM summary race
+  // produced nothing (failed / keyless / over 3s), register a deterministic
+  // baseline so a fleet roll-call can always tell who is on the mesh. The LLM
+  // summary still wins when it lands (late-retry below) and set_summary still
+  // overrides — this only replaces the "" that used to register as a blank peer.
+  const baselineSummary = `${myNickname} on ${MACHINE_NAME} (${cwdBasename(myCwd)}) — idle, awaiting directive`;
+  const registerSummary = initialSummary || baselineSummary;
+
+  // Ensure broker + register, retrying until success. Never throws out — a
+  // broker outage degrades (tools return "Not registered with broker yet") but
+  // the server stays alive and reconnects on its own.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await ensureBroker();
+      const reg = await brokerFetch<RegisterResponse>("/register", {
+        requested_id: myRequestedId,
+        nickname: myNickname,
+        context_window: myContextWindow,
+        context_used: myContextUsed,
+        context_note: myContextNote,
+        tier: (process.env.CLAUDE_PEERS_TIER as "production" | "staging" | "infrastructure" | undefined) ?? "production",
+        payload_version: 1,
+        pid: process.pid,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        tty: myTty,
+        machine: MACHINE_NAME,
+        summary: registerSummary,
+      });
+      myId = reg.id;
+      mySummary = registerSummary;
+      log(`Registered as peer ${myId} on machine ${MACHINE_NAME}`);
+      break;
+    } catch (e) {
+      log(`Broker bring-up attempt ${attempt} failed (retrying in ${REGISTER_RETRY_MS}ms): ${e instanceof Error ? e.message : String(e)}`);
+      await sleep(REGISTER_RETRY_MS);
+    }
+  }
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -810,20 +835,16 @@ async function main() {
     });
   }
 
-  // 5. Connect MCP over stdio
-  await mcp.connect(new StdioServerTransport());
-  log("MCP connected");
+  // Start polling for inbound messages
+  pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
-
-  // 7. Start heartbeat
-  const heartbeatTimer = setInterval(async () => {
+  // Start heartbeat
+  heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
         if (parentProcessChanged()) {
           log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned MCP server`);
-          await cleanup();
+          await cleanupAndExit();
           return;
         }
         const heartbeat = await brokerFetch<{ ok: boolean; found?: boolean }>("/heartbeat", { id: myId });
@@ -851,24 +872,47 @@ async function main() {
       }
     }
   }, HEARTBEAT_INTERVAL_MS);
+}
 
-  // 8. Clean up on exit
-  const cleanup = async () => {
-    clearInterval(pollTimer);
-    clearInterval(heartbeatTimer);
-    if (myId) {
-      try {
-        await brokerFetch("/unregister", { id: myId });
-        log("Unregistered from broker");
-      } catch {
-        // Best effort
-      }
-    }
-    process.exit(0);
-  };
+async function main() {
+  // Gather cheap local context (no network) — needed for nickname + register.
+  myCwd = process.cwd();
+  myGitRoot = await getGitRoot(myCwd);
+  const tty = getTty();
+  myTty = tty;
 
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  log(`Machine: ${MACHINE_NAME}`);
+  log(`Nickname: ${myNickname || "(none)"}`);
+  log(`Broker: ${BROKER_URL}`);
+  log(`CWD: ${myCwd}`);
+  log(`Git root: ${myGitRoot ?? "(none)"}`);
+  log(`TTY: ${tty ?? "(unknown)"}`);
+  if (!myNickname) {
+    myNickname = defaultNickname(MACHINE_NAME, myCwd, tty);
+    log(`Auto-nickname: ${myNickname}`);
+  }
+  myRequestedId = process.env.CLAUDE_PEER_ID ?? stablePeerId(MACHINE_NAME, myCwd, tty);
+
+  // Connect MCP over stdio FIRST. The harness handshake must succeed
+  // immediately and unconditionally — even if the broker is unreachable —
+  // because Claude Code never auto-restarts a stdio server that fails to come
+  // up. Tool handlers guard on `myId` ("Not registered with broker yet") until
+  // background registration lands, so connecting before the broker is up is
+  // safe. (Previously connect was the LAST step, gated behind ensureBroker + a
+  // 3s summary race + /register; any blip there threw → process.exit(1) → a
+  // permanently-dead client until a manual /mcp reconnect.)
+  await mcp.connect(new StdioServerTransport());
+  log("MCP connected");
+
+  // Register exit handlers now, before the (retrying) broker bring-up.
+  process.on("SIGINT", cleanupAndExit);
+  process.on("SIGTERM", cleanupAndExit);
+
+  // Bring up broker + registration in the background; never blocks or kills the
+  // already-connected transport.
+  bringUpBroker().catch((e) => {
+    log(`Broker bring-up crashed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  });
 }
 
 main().catch((e) => {
