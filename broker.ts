@@ -276,6 +276,23 @@ function normalizeTier(tier: unknown): "production" | "staging" | "infrastructur
   return tier === "staging" || tier === "infrastructure" ? tier : "production";
 }
 
+// Mirror of the client's auto-nickname (server.ts defaultNickname) so the broker
+// can tell an operator-chosen nickname apart from a regenerated default.
+// Keep in sync with server.ts cwdBasename/shortTty/defaultNickname.
+function cwdBasename(cwd: string): string {
+  return cwd.split(/[\\/]/).filter(Boolean).pop() || "home";
+}
+
+function shortTty(tty: string | null): string {
+  if (!tty) return "no-tty";
+  const digits = tty.match(/(\d+)$/)?.[1];
+  return digits ? digits.padStart(3, "0") : tty.replace(/[^a-zA-Z0-9_-]/g, "-");
+}
+
+function defaultNickname(machine: string, cwd: string, tty: string | null): string {
+  return `${machine}:${cwdBasename(cwd)}:${shortTty(tty)}`.slice(0, 64);
+}
+
 function normalizePayloadVersion(version: unknown): number {
   const num = typeof version === "number" ? version : Number(version);
   return Number.isInteger(num) && num > 0 ? num : 1;
@@ -301,22 +318,49 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   // Clients own peer identity. The broker validates and records requested_id;
   // it does not mint IDs for production registrations.
+
+  // Preserve operator-set identity metadata across re-registrations: the
+  // delete-then-insert below would otherwise wipe nickname/summary/context on
+  // every MCP restart and heartbeat-miss recovery. Capture the prior row first
+  // (same id, else same pid+machine lineage), then carry over any field the
+  // client sent empty or as its regenerated auto-default.
+  type PeerIdentity = Pick<
+    Peer,
+    "nickname" | "summary" | "context_window" | "context_used" | "context_note"
+  >;
+  const priorById = db
+    .query(
+      "SELECT nickname, summary, context_window, context_used, context_note FROM peers WHERE id = ?"
+    )
+    .get(id) as PeerIdentity | null;
   deletePeer.run(id);
 
   // Remove any existing registration for this PID + machine combo (re-registration)
   const existing = db
-    .query("SELECT id FROM peers WHERE pid = ? AND machine = ?")
-    .get(body.pid, machine) as { id: string } | null;
+    .query(
+      "SELECT id, nickname, summary, context_window, context_used, context_note FROM peers WHERE pid = ? AND machine = ?"
+    )
+    .get(body.pid, machine) as (PeerIdentity & { id: string }) | null;
   if (existing) {
     deletePeer.run(existing.id);
   }
 
+  const prior = priorById ?? existing;
+  const carriedNickname =
+    nickname === "" || nickname === defaultNickname(machine, body.cwd, body.tty ?? null)
+      ? (prior?.nickname ?? nickname)
+      : nickname;
+  const carriedSummary = body.summary ? body.summary : (prior?.summary ?? "");
+  const carriedContextWindow = contextWindow ?? prior?.context_window ?? null;
+  const carriedContextUsed = contextUsed ?? prior?.context_used ?? null;
+  const carriedContextNote = contextNote === "" ? (prior?.context_note ?? "") : contextNote;
+
   insertPeer.run(
     id,
-    nickname,
-    contextWindow,
-    contextUsed,
-    contextNote,
+    carriedNickname,
+    carriedContextWindow,
+    carriedContextUsed,
+    carriedContextNote,
     tier,
     payloadVersion,
     body.pid,
@@ -324,7 +368,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     body.git_root,
     body.tty,
     machine,
-    body.summary,
+    carriedSummary,
     now,
     now
   );
@@ -340,8 +384,12 @@ function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
-function handleSetNickname(body: SetNicknameRequest): void {
-  updateNickname.run(normalizeNickname(body.nickname), body.id);
+function handleSetNickname(body: SetNicknameRequest): { ok: boolean; error?: string } {
+  const result = updateNickname.run(normalizeNickname(body.nickname), body.id);
+  if (result.changes === 0) {
+    return { ok: false, error: "peer not found or stale" };
+  }
+  return { ok: true };
 }
 
 function handleSetContext(body: SetContextRequest): void {
@@ -480,8 +528,7 @@ Bun.serve({
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });
         case "/set-nickname":
-          handleSetNickname(body as SetNicknameRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleSetNickname(body as SetNicknameRequest));
         case "/set-context":
           handleSetContext(body as SetContextRequest);
           return Response.json({ ok: true });
