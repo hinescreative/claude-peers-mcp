@@ -71,10 +71,19 @@ function authHeaders(): Record<string, string> {
 }
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  // Hard request deadline (Clarvis 2026-08-12). Without this, a half-dead socket to the broker
+  // made this await HANG FOREVER: the 1s setInterval poll (pollAndPushMessages) kept spawning new
+  // hung fetches, none threw, so its catch never fired → the transport went SILENT for up to ~69h
+  // (a mute, not an error). Root cause: this box is Wes's TRAVEL laptop — lid-close / network-switch
+  // kills the long-poll socket mid-flight. Pairs with c7adea0's startup retry (which handles a
+  // broker-unreachable window on wake). Mirrors isBrokerAlive()/health below; on abort the poll
+  // catch logs and setInterval retries next tick. /poll-messages is not a long-poll, so 8s is far
+  // above normal broker RTT (<100ms). See fleet memory reference-mcp-transport-disconnect-vs-husk-2026-08-11.
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(8000),
   });
   if (!res.ok) {
     const err = await res.text();
