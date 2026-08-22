@@ -20,6 +20,7 @@ import type {
   SetSummaryRequest,
   SetNicknameRequest,
   SetContextRequest,
+  SetStateRequest,
   ListPeersRequest,
   SendMessageRequest,
   PollMessagesRequest,
@@ -64,6 +65,11 @@ db.run(`
     context_note TEXT NOT NULL DEFAULT '',
     tier TEXT NOT NULL DEFAULT 'production',
     payload_version INTEGER NOT NULL DEFAULT 1,
+    parent_id TEXT,
+    runtime TEXT,
+    rings TEXT,
+    blocked_on TEXT,
+    blocked_since TEXT,
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
@@ -107,6 +113,31 @@ try {
 }
 try {
   db.run("ALTER TABLE peers ADD COLUMN payload_version INTEGER NOT NULL DEFAULT 1");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN parent_id TEXT");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN runtime TEXT");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN rings TEXT");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN blocked_on TEXT");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE peers ADD COLUMN blocked_since TEXT");
 } catch {
   // Column already exists
 }
@@ -186,8 +217,8 @@ function checkAuth(req: Request): Response | null {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, nickname, context_window, context_used, context_note, tier, payload_version, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, nickname, context_window, context_used, context_note, tier, payload_version, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen, parent_id, runtime, rings, blocked_on, blocked_since)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -204,6 +235,14 @@ const updateNickname = db.prepare(`
 
 const updateContext = db.prepare(`
   UPDATE peers SET context_window = ?, context_used = ?, context_note = ? WHERE id = ?
+`);
+
+const updateHeartbeatContext = db.prepare(`
+  UPDATE peers SET last_seen = ?, context_window = COALESCE(?, context_window), context_used = COALESCE(?, context_used) WHERE id = ?
+`);
+
+const updateState = db.prepare(`
+  UPDATE peers SET blocked_on = ?, blocked_since = ? WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -276,9 +315,81 @@ function normalizeTier(tier: unknown): "production" | "staging" | "infrastructur
   return tier === "staging" || tier === "infrastructure" ? tier : "production";
 }
 
+// Mirror of the client's auto-nickname (server.ts defaultNickname) so the broker
+// can tell an operator-chosen nickname apart from a regenerated default.
+// Keep in sync with server.ts cwdBasename/shortTty/defaultNickname.
+function cwdBasename(cwd: string): string {
+  return cwd.split(/[\\/]/).filter(Boolean).pop() || "home";
+}
+
+function shortTty(tty: string | null): string {
+  if (!tty) return "no-tty";
+  const digits = tty.match(/(\d+)$/)?.[1];
+  return digits ? digits.padStart(3, "0") : tty.replace(/[^a-zA-Z0-9_-]/g, "-");
+}
+
+function defaultNickname(machine: string, cwd: string, tty: string | null): string {
+  return `${machine}:${cwdBasename(cwd)}:${shortTty(tty)}`.slice(0, 64);
+}
+
 function normalizePayloadVersion(version: unknown): number {
   const num = typeof version === "number" ? version : Number(version);
   return Number.isInteger(num) && num > 0 ? num : 1;
+}
+
+function normalizeParentId(id: unknown): string | null {
+  if (typeof id !== "string") return null;
+  const trimmed = id.trim().slice(0, 64);
+  return trimmed || null;
+}
+
+function normalizeRuntime(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().slice(0, 32);
+  return /^[a-zA-Z0-9_-]+$/.test(trimmed) ? trimmed : null;
+}
+
+function normalizeRings(value: unknown): string | null {
+  let arr: unknown[] | null = null;
+  if (Array.isArray(value)) {
+    arr = value;
+  } else if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) arr = parsed;
+    } catch {
+      return null;
+    }
+  }
+  if (!arr) return null;
+  const nums = arr.filter((v): v is number => Number.isInteger(v) && v >= 0 && v <= 3);
+  return nums.length ? JSON.stringify(nums) : null;
+}
+
+function normalizeBlockedOn(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().slice(0, 128);
+  return trimmed === "" ? null : trimmed;
+}
+
+function decodeRings(raw: unknown): number[] | null {
+  if (Array.isArray(raw)) {
+    return raw.filter((v): v is number => Number.isInteger(v) && v >= 0 && v <= 3);
+  }
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((v: unknown): v is number => Number.isInteger(v) && v >= 0 && v <= 3)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function decodePeer(row: Peer & { rings?: unknown }): Peer {
+  return { ...row, rings: decodeRings(row.rings) };
 }
 
 // --- Request handlers ---
@@ -301,22 +412,62 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   // Clients own peer identity. The broker validates and records requested_id;
   // it does not mint IDs for production registrations.
+
+  // Preserve operator-set identity metadata across re-registrations: the
+  // delete-then-insert below would otherwise wipe nickname/summary/context on
+  // every MCP restart and heartbeat-miss recovery. Capture the prior row first
+  // (same id, else same pid+machine lineage), then carry over any field the
+  // client sent empty or as its regenerated auto-default.
+  type PeerIdentity = Pick<
+    Peer,
+    | "nickname"
+    | "summary"
+    | "context_window"
+    | "context_used"
+    | "context_note"
+    | "parent_id"
+    | "runtime"
+    | "blocked_on"
+    | "blocked_since"
+  > & { rings?: unknown };
+  const priorById = db
+    .query(
+      "SELECT nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE id = ?"
+    )
+    .get(id) as PeerIdentity | null;
   deletePeer.run(id);
 
   // Remove any existing registration for this PID + machine combo (re-registration)
   const existing = db
-    .query("SELECT id FROM peers WHERE pid = ? AND machine = ?")
-    .get(body.pid, machine) as { id: string } | null;
+    .query(
+      "SELECT id, nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE pid = ? AND machine = ?"
+    )
+    .get(body.pid, machine) as (PeerIdentity & { id: string }) | null;
   if (existing) {
     deletePeer.run(existing.id);
   }
 
+  const prior = priorById ?? existing;
+  const carriedNickname =
+    nickname === "" || nickname === defaultNickname(machine, body.cwd, body.tty ?? null)
+      ? (prior?.nickname ?? nickname)
+      : nickname;
+  const carriedSummary = body.summary ? body.summary : (prior?.summary ?? "");
+  const carriedContextWindow = contextWindow ?? prior?.context_window ?? null;
+  const carriedContextUsed = contextUsed ?? prior?.context_used ?? null;
+  const carriedContextNote = contextNote === "" ? (prior?.context_note ?? "") : contextNote;
+  const parentId = normalizeParentId(body.parent_id) ?? prior?.parent_id ?? null;
+  const runtime = normalizeRuntime(body.runtime) ?? prior?.runtime ?? null;
+  const rings = normalizeRings(body.rings) ?? (typeof prior?.rings === "string" ? prior.rings : normalizeRings(prior?.rings));
+  const blockedOn = prior?.blocked_on ?? null;
+  const blockedSince = prior?.blocked_since ?? null;
+
   insertPeer.run(
     id,
-    nickname,
-    contextWindow,
-    contextUsed,
-    contextNote,
+    carriedNickname,
+    carriedContextWindow,
+    carriedContextUsed,
+    carriedContextNote,
     tier,
     payloadVersion,
     body.pid,
@@ -324,15 +475,55 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     body.git_root,
     body.tty,
     machine,
-    body.summary,
+    carriedSummary,
     now,
-    now
+    now,
+    parentId,
+    runtime,
+    rings,
+    blockedOn,
+    blockedSince
   );
   return { id };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; found: boolean } {
-  const result = updateLastSeen.run(new Date().toISOString(), body.id);
+  const now = new Date().toISOString();
+  const window = body.context_window !== undefined ? normalizeOptionalInt(body.context_window) : undefined;
+  const used = body.context_used !== undefined ? normalizeOptionalInt(body.context_used) : undefined;
+  if (window !== undefined || used !== undefined) {
+    const result = updateHeartbeatContext.run(now, window ?? null, used ?? null, body.id);
+    return { ok: true, found: result.changes > 0 };
+  }
+  const result = updateLastSeen.run(now, body.id);
+  return { ok: true, found: result.changes > 0 };
+}
+
+function handleSetState(body: SetStateRequest): { ok: boolean; found: boolean } {
+  const blockedOn =
+    body.blocked_on === undefined ? undefined : normalizeBlockedOn(body.blocked_on);
+  const blockedSince =
+    body.blocked_since === undefined
+      ? undefined
+      : typeof body.blocked_since === "string" && body.blocked_since.trim()
+        ? body.blocked_since.trim()
+        : null;
+  const row = db
+    .query("SELECT blocked_on, blocked_since FROM peers WHERE id = ?")
+    .get(body.id) as { blocked_on: string | null; blocked_since: string | null } | null;
+  if (!row) {
+    return { ok: false, found: false };
+  }
+  const nextOn = blockedOn === undefined ? row.blocked_on : blockedOn;
+  const nextSince =
+    blockedSince !== undefined
+      ? blockedSince
+      : blockedOn === undefined
+        ? row.blocked_since
+        : blockedOn
+          ? new Date().toISOString()
+          : null;
+  const result = updateState.run(nextOn, nextSince, body.id);
   return { ok: true, found: result.changes > 0 };
 }
 
@@ -340,8 +531,12 @@ function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
-function handleSetNickname(body: SetNicknameRequest): void {
-  updateNickname.run(normalizeNickname(body.nickname), body.id);
+function handleSetNickname(body: SetNicknameRequest): { ok: boolean; error?: string } {
+  const result = updateNickname.run(normalizeNickname(body.nickname), body.id);
+  if (result.changes === 0) {
+    return { ok: false, error: "peer not found or stale" };
+  }
+  return { ok: true };
 }
 
 function handleSetContext(body: SetContextRequest): void {
@@ -391,7 +586,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
   // For local peers, verify process is still alive
   const hostname = require("os").hostname();
-  return peers.filter((p) => {
+  peers = peers.filter((p) => {
     if (peerIsStale(p)) {
       deletePeerAndUndeliveredMessages(p.id);
       return false;
@@ -409,6 +604,20 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     // Remote peers — trust heartbeat-based cleanup
     return true;
   });
+
+  // Optional: hide headless "idle, awaiting directive" zombies from tasking lists
+  if (body.active_only) {
+    const idleRe = /idle,?\s*awaiting directive/i;
+    peers = peers.filter((p) => {
+      const noTty = !p.tty || p.tty === "" || p.tty === "null";
+      const idleSummary = idleRe.test(p.summary || "");
+      // Keep if has a real tty OR summary is not the default idle boilerplate
+      if (noTty && idleSummary) return false;
+      return true;
+    });
+  }
+
+  return peers.map(decodePeer);
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
@@ -480,11 +689,12 @@ Bun.serve({
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });
         case "/set-nickname":
-          handleSetNickname(body as SetNicknameRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleSetNickname(body as SetNicknameRequest));
         case "/set-context":
           handleSetContext(body as SetContextRequest);
           return Response.json({ ok: true });
+        case "/set-state":
+          return Response.json(handleSetState(body as SetStateRequest));
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":

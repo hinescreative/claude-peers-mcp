@@ -17,6 +17,11 @@ export interface Peer {
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+  parent_id: string | null;
+  runtime: string | null;
+  rings: number[] | null;
+  blocked_on: string | null;
+  blocked_since: string | null;
 }
 
 export interface Message {
@@ -44,6 +49,9 @@ export interface RegisterRequest {
   tty: string | null;
   machine: string;
   summary: string;
+  parent_id?: string | null;
+  runtime?: string | null;
+  rings?: number[] | string | null;
 }
 
 export interface RegisterResponse {
@@ -52,6 +60,8 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest {
   id: PeerId;
+  context_window?: number | null;
+  context_used?: number | null;
 }
 
 export interface SetSummaryRequest {
@@ -71,6 +81,12 @@ export interface SetContextRequest {
   context_note?: string;
 }
 
+export interface SetStateRequest {
+  id: PeerId;
+  blocked_on?: string | null;
+  blocked_since?: string | null;
+}
+
 export interface ListPeersRequest {
   scope: "machine" | "directory" | "repo" | "fleet";
   // The requesting peer's context (used for filtering)
@@ -78,6 +94,12 @@ export interface ListPeersRequest {
   git_root: string | null;
   machine?: string;
   exclude_id?: PeerId;
+  /**
+   * When true, hide default zombie noise:
+   * - no TTY (headless) AND summary matches idle/awaiting boilerplate
+   * Orchestrators should default this on for tasking.
+   */
+  active_only?: boolean;
 }
 
 export interface SendMessageRequest {
