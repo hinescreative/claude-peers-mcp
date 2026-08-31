@@ -11,6 +11,7 @@
     "dashboard": "bun dashboard-server.ts",
     "codex-server": "bun codex-server.ts",
     "server": "bun server.ts",
+    "grok-edge": "bun grok-edge.ts",
     "test": "bun test"
   },
   "devDependencies": {
