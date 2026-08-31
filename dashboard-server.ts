@@ -2,16 +2,26 @@
 /**
  * Local operator dashboard for claude-peers.
  *
- * Intended origin:
- *   Cloudflare Access + Tunnel -> 127.0.0.1:8799 -> broker HTTP API
- *
- * The browser never sees CLAUDE_PEERS_TOKEN.
+ * Intended origin: tailnet or localhost -> this process -> broker HTTP API.
+ * The browser never sees CLAUDE_PEERS_TOKEN. Does not proxy /purge.
  */
 
+import { execFile } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { extname, normalize } from "node:path";
 import type { Peer } from "./shared/types.ts";
+
+const execFileAsync = promisify(execFile);
+const TAILSCALE_CANDIDATES = [
+  process.env.TAILSCALE_BIN,
+  "tailscale",
+  "/usr/bin/tailscale",
+  "/opt/homebrew/bin/tailscale",
+  "/usr/local/bin/tailscale",
+  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+].filter((p): p is string => Boolean(p));
 
 const DASHBOARD_PORT = parseInt(process.env.CLAUDE_PEERS_DASHBOARD_PORT ?? "8799", 10);
 const DASHBOARD_HOST = process.env.CLAUDE_PEERS_DASHBOARD_HOST ?? "127.0.0.1";
@@ -98,6 +108,69 @@ async function listPeers(scope = "repo"): Promise<Peer[]> {
   });
 }
 
+type TailnetNode = {
+  id: string;
+  hostName: string;
+  dnsName: string;
+  os: string;
+  online: boolean;
+  ips: string[];
+  lastSeen: string;
+  relay: string;
+};
+
+function slimNode(node: Record<string, unknown> | undefined): TailnetNode | null {
+  if (!node) return null;
+  const ips = Array.isArray(node.TailscaleIPs) ? node.TailscaleIPs.filter((ip): ip is string => typeof ip === "string") : [];
+  return {
+    id: String(node.ID ?? ""),
+    hostName: String(node.HostName ?? ""),
+    dnsName: String(node.DNSName ?? ""),
+    os: String(node.OS ?? ""),
+    online: Boolean(node.Online),
+    ips,
+    lastSeen: String(node.LastSeen ?? ""),
+    relay: String(node.Relay ?? ""),
+  };
+}
+
+async function runTailscaleStatus(): Promise<string> {
+  let lastErr: Error | null = null;
+  for (const bin of TAILSCALE_CANDIDATES) {
+    try {
+      const { stdout } = await execFileAsync(bin, ["status", "--json"], {
+        timeout: 8000,
+        maxBuffer: 4_000_000,
+      });
+      return stdout;
+    } catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+    }
+  }
+  throw lastErr ?? new Error("tailscale not found");
+}
+
+async function readTailnet(): Promise<{ backendState: string; self: TailnetNode | null; peers: TailnetNode[] }> {
+  const stdout = await runTailscaleStatus();
+  const raw = JSON.parse(stdout) as {
+    BackendState?: string;
+    Self?: Record<string, unknown>;
+    Peer?: Record<string, Record<string, unknown>>;
+  };
+  const peers: TailnetNode[] = [];
+  if (raw.Peer && typeof raw.Peer === "object") {
+    for (const node of Object.values(raw.Peer)) {
+      const slim = slimNode(node);
+      if (slim) peers.push(slim);
+    }
+  }
+  return {
+    backendState: raw.BackendState ?? "unknown",
+    self: slimNode(raw.Self),
+    peers,
+  };
+}
+
 async function resolvePeerId(input: Record<string, unknown>): Promise<string | null> {
   if (typeof input.id === "string" && input.id.trim()) return input.id.trim();
   if (typeof input.nickname !== "string" || !input.nickname.trim()) return null;
@@ -142,7 +215,21 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
   }
 
   if (url.pathname === "/api/peers") {
-    sendJson(res, 200, { peers: await listPeers(url.searchParams.get("scope") ?? "repo") });
+    sendJson(res, 200, { peers: await listPeers(url.searchParams.get("scope") ?? "fleet") });
+    return;
+  }
+
+  if (url.pathname === "/api/tailnet") {
+    try {
+      sendJson(res, 200, await readTailnet());
+    } catch (e) {
+      sendJson(res, 502, { error: e instanceof Error ? e.message : String(e) });
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/purge" || url.pathname.includes("purge")) {
+    sendJson(res, 404, { error: "not found" });
     return;
   }
 
