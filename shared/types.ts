@@ -9,6 +9,7 @@ export interface Peer {
   context_note: string;
   tier: "production" | "staging" | "infrastructure";
   payload_version: number;
+  instance_id: string | null;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -37,6 +38,7 @@ export interface Message {
 
 export interface RegisterRequest {
   requested_id: string;
+  instance_id?: string;
   nickname?: string;
   context_window?: number | null;
   context_used?: number | null;
@@ -56,32 +58,40 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  role?: "owner" | "standby";
+  lease_id?: string | null;
+  lease_expires_at?: string;
 }
 
-export interface HeartbeatRequest {
+export interface LeaseCredentials {
+  instance_id?: string;
+  lease_id?: string;
+}
+
+export interface HeartbeatRequest extends LeaseCredentials {
   id: PeerId;
   context_window?: number | null;
   context_used?: number | null;
 }
 
-export interface SetSummaryRequest {
+export interface SetSummaryRequest extends LeaseCredentials {
   id: PeerId;
   summary: string;
 }
 
-export interface SetNicknameRequest {
+export interface SetNicknameRequest extends LeaseCredentials {
   id: PeerId;
   nickname: string;
 }
 
-export interface SetContextRequest {
+export interface SetContextRequest extends LeaseCredentials {
   id: PeerId;
   context_window?: number | null;
   context_used?: number | null;
   context_note?: string;
 }
 
-export interface SetStateRequest {
+export interface SetStateRequest extends LeaseCredentials {
   id: PeerId;
   blocked_on?: string | null;
   blocked_since?: string | null;
@@ -102,7 +112,7 @@ export interface ListPeersRequest {
   active_only?: boolean;
 }
 
-export interface SendMessageRequest {
+export interface SendMessageRequest extends LeaseCredentials {
   from_id: PeerId;
   to_id: PeerId;
   text: string;
@@ -114,4 +124,26 @@ export interface PollMessagesRequest {
 
 export interface PollMessagesResponse {
   messages: Message[];
+}
+
+export interface ClaimMessagesRequest extends LeaseCredentials {
+  id: PeerId;
+}
+
+export interface ClaimMessagesResponse {
+  messages: Message[];
+}
+
+export interface AckMessagesRequest extends LeaseCredentials {
+  id: PeerId;
+  message_ids: number[];
+}
+
+export interface AckMessagesResponse {
+  ok: boolean;
+  acked: number;
+}
+
+export interface UnregisterRequest extends LeaseCredentials {
+  id: PeerId;
 }

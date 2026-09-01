@@ -25,6 +25,12 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  ClaimMessagesRequest,
+  ClaimMessagesResponse,
+  AckMessagesRequest,
+  AckMessagesResponse,
+  UnregisterRequest,
+  LeaseCredentials,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -37,6 +43,16 @@ const REQUIRE_AUTH =
   process.env.CLAUDE_PEERS_REQUIRE_AUTH === "true";
 const TTL_MINUTES = parseInt(process.env.CLAUDE_PEERS_TTL_MINUTES ?? "20", 10);
 const STALE_PEER_MS = Math.max(1, Number.isFinite(TTL_MINUTES) ? TTL_MINUTES : 20) * 60 * 1000;
+const parsedLeaseTtl = Number(process.env.CLAUDE_PEERS_LEASE_TTL_MS ?? "45000");
+const LEASE_TTL_MS = Number.isFinite(parsedLeaseTtl) && parsedLeaseTtl > 0 ? parsedLeaseTtl : 45_000;
+const parsedVisibilityTimeout = Number(
+  process.env.CLAUDE_PEERS_VISIBILITY_TIMEOUT_MS ?? "30000",
+);
+const VISIBILITY_TIMEOUT_MS =
+  Number.isFinite(parsedVisibilityTimeout) && parsedVisibilityTimeout > 0
+    ? parsedVisibilityTimeout
+    : 30_000;
+const CLAIM_BATCH_SIZE = 100;
 
 if (REQUIRE_AUTH && !AUTH_TOKEN) {
   console.error("[claude-peers broker] FATAL: CLAUDE_PEERS_REQUIRE_AUTH is set but CLAUDE_PEERS_TOKEN is empty.");
@@ -65,6 +81,7 @@ db.run(`
     context_note TEXT NOT NULL DEFAULT '',
     tier TEXT NOT NULL DEFAULT 'production',
     payload_version INTEGER NOT NULL DEFAULT 1,
+    instance_id TEXT,
     parent_id TEXT,
     runtime TEXT,
     rings TEXT,
@@ -117,6 +134,11 @@ try {
   // Column already exists
 }
 try {
+  db.run("ALTER TABLE peers ADD COLUMN instance_id TEXT");
+} catch {
+  // Column already exists
+}
+try {
   db.run("ALTER TABLE peers ADD COLUMN parent_id TEXT");
 } catch {
   // Column already exists
@@ -150,12 +172,49 @@ db.run(`
     text TEXT NOT NULL,
     sent_at TEXT NOT NULL,
     delivered INTEGER NOT NULL DEFAULT 0,
+    claim_expires_at TEXT,
+    claimed_by_lease_fingerprint TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (from_id) REFERENCES peers(id),
     FOREIGN KEY (to_id) REFERENCES peers(id)
   )
 `);
 
+try {
+  db.run("ALTER TABLE messages ADD COLUMN claim_expires_at TEXT");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE messages ADD COLUMN claimed_by_lease_fingerprint TEXT");
+} catch {
+  // Column already exists
+}
+try {
+  db.run("ALTER TABLE messages ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0");
+} catch {
+  // Column already exists
+}
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS peer_leases (
+    peer_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    lease_id TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (peer_id) REFERENCES peers(id) ON DELETE CASCADE
+  )
+`);
+
+db.run(`
+  CREATE INDEX IF NOT EXISTS idx_messages_delivery_claim
+  ON messages (to_id, delivered, claim_expires_at, sent_at, id)
+`);
+
 function deletePeerAndUndeliveredMessages(id: string): void {
+  db.run("DELETE FROM peer_leases WHERE peer_id = ?", [id]);
   db.run("DELETE FROM peers WHERE id = ?", [id]);
   db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
 }
@@ -217,8 +276,8 @@ function checkAuth(req: Request): Response | null {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, nickname, context_window, context_used, context_note, tier, payload_version, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen, parent_id, runtime, rings, blocked_on, blocked_since)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, nickname, context_window, context_used, context_note, tier, payload_version, instance_id, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen, parent_id, runtime, rings, blocked_on, blocked_since)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -249,6 +308,25 @@ const deletePeer = db.prepare(`
   DELETE FROM peers WHERE id = ?
 `);
 
+const deletePeerLease = db.prepare(`
+  DELETE FROM peer_leases WHERE peer_id = ?
+`);
+
+const selectPeerLease = db.prepare(`
+  SELECT peer_id, instance_id, lease_id, expires_at, created_at, updated_at
+  FROM peer_leases WHERE peer_id = ?
+`);
+
+const insertPeerLease = db.prepare(`
+  INSERT INTO peer_leases (peer_id, instance_id, lease_id, expires_at, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const renewPeerLease = db.prepare(`
+  UPDATE peer_leases SET expires_at = ?, updated_at = ?
+  WHERE peer_id = ? AND instance_id = ? AND lease_id = ?
+`);
+
 const selectAllPeers = db.prepare(`
   SELECT * FROM peers
 `);
@@ -271,11 +349,43 @@ const insertMessage = db.prepare(`
 `);
 
 const selectUndelivered = db.prepare(`
-  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
+  SELECT id, from_id, to_id, text, sent_at, delivered
+  FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC, id ASC
 `);
 
 const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
+  UPDATE messages
+  SET delivered = 1, claim_expires_at = NULL, claimed_by_lease_fingerprint = NULL
+  WHERE id = ?
+`);
+
+const selectClaimableMessages = db.prepare(`
+  SELECT id, from_id, to_id, text, sent_at, delivered
+  FROM messages
+  WHERE to_id = ?
+    AND delivered = 0
+    AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+  ORDER BY sent_at ASC, id ASC
+  LIMIT ${CLAIM_BATCH_SIZE}
+`);
+
+const claimMessage = db.prepare(`
+  UPDATE messages
+  SET claim_expires_at = ?,
+      claimed_by_lease_fingerprint = ?,
+      delivery_attempts = delivery_attempts + 1
+  WHERE id = ?
+    AND delivered = 0
+    AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+`);
+
+const ackClaimedMessage = db.prepare(`
+  UPDATE messages
+  SET delivered = 1, claim_expires_at = NULL, claimed_by_lease_fingerprint = NULL
+  WHERE id = ?
+    AND to_id = ?
+    AND delivered = 0
+    AND claimed_by_lease_fingerprint = ?
 `);
 
 // --- Generate peer ID ---
@@ -287,6 +397,72 @@ function generateId(): string {
     id += chars[Math.floor(Math.random() * chars.length)];
   }
   return id;
+}
+
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+interface PeerLease {
+  peer_id: string;
+  instance_id: string;
+  lease_id: string;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+function getPeerLease(id: string): PeerLease | null {
+  return selectPeerLease.get(id) as PeerLease | null;
+}
+
+function leaseFingerprint(leaseId: string): string {
+  return new Bun.CryptoHasher("sha256").update(leaseId).digest("hex");
+}
+
+function leaseIsExpired(lease: PeerLease, now = Date.now()): boolean {
+  const expiresAt = Date.parse(lease.expires_at);
+  return !Number.isFinite(expiresAt) || expiresAt <= now;
+}
+
+function normalizeInstanceId(instanceId: unknown): string | null {
+  if (typeof instanceId !== "string") return null;
+  const trimmed = instanceId.trim();
+  return /^[a-zA-Z0-9][a-zA-Z0-9._:-]{2,127}$/.test(trimmed) ? trimmed : null;
+}
+
+function requireLeaseOwner(id: string, credentials: LeaseCredentials): PeerLease | null {
+  const lease = getPeerLease(id);
+  if (!lease) return null;
+
+  if (
+    leaseIsExpired(lease) ||
+    credentials.instance_id !== lease.instance_id ||
+    credentials.lease_id !== lease.lease_id
+  ) {
+    throw new HttpError(409, "peer lease conflict");
+  }
+  return lease;
+}
+
+function extendLease(lease: PeerLease, now = new Date()): string {
+  const expiresAt = new Date(now.getTime() + LEASE_TTL_MS).toISOString();
+  const result = renewPeerLease.run(
+    expiresAt,
+    now.toISOString(),
+    lease.peer_id,
+    lease.instance_id,
+    lease.lease_id,
+  );
+  if (result.changes !== 1) {
+    throw new HttpError(409, "peer lease conflict");
+  }
+  return expiresAt;
 }
 
 function normalizeRequestedId(id: unknown): string | null {
@@ -394,56 +570,53 @@ function decodePeer(row: Peer & { rings?: unknown }): Peer {
 
 // --- Request handlers ---
 
-function handleRegister(body: RegisterRequest): RegisterResponse {
-  cleanStalePeers();
+type PeerIdentity = Pick<
+  Peer,
+  | "nickname"
+  | "summary"
+  | "context_window"
+  | "context_used"
+  | "context_note"
+  | "parent_id"
+  | "runtime"
+  | "blocked_on"
+  | "blocked_since"
+> & { rings?: unknown };
 
-  const id = normalizeRequestedId(body.requested_id);
-  if (!id) {
-    throw new Error("register requires requested_id");
-  }
+function replacePeerRegistration(
+  body: RegisterRequest,
+  id: string,
+  payloadVersion: number,
+  instanceId: string | null,
+): void {
   const nickname = normalizeNickname(body.nickname);
   const contextWindow = normalizeOptionalInt(body.context_window);
   const contextUsed = normalizeOptionalInt(body.context_used);
   const contextNote = normalizeContextNote(body.context_note);
   const tier = normalizeTier(body.tier);
-  const payloadVersion = normalizePayloadVersion(body.payload_version);
   const now = new Date().toISOString();
   const machine = body.machine || "unknown";
-
-  // Clients own peer identity. The broker validates and records requested_id;
-  // it does not mint IDs for production registrations.
 
   // Preserve operator-set identity metadata across re-registrations: the
   // delete-then-insert below would otherwise wipe nickname/summary/context on
   // every MCP restart and heartbeat-miss recovery. Capture the prior row first
   // (same id, else same pid+machine lineage), then carry over any field the
   // client sent empty or as its regenerated auto-default.
-  type PeerIdentity = Pick<
-    Peer,
-    | "nickname"
-    | "summary"
-    | "context_window"
-    | "context_used"
-    | "context_note"
-    | "parent_id"
-    | "runtime"
-    | "blocked_on"
-    | "blocked_since"
-  > & { rings?: unknown };
   const priorById = db
     .query(
       "SELECT nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE id = ?"
     )
     .get(id) as PeerIdentity | null;
-  deletePeer.run(id);
-
   // Remove any existing registration for this PID + machine combo (re-registration)
   const existing = db
     .query(
-      "SELECT id, nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE pid = ? AND machine = ?"
+      "SELECT id, nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE pid = ? AND machine = ? AND id <> ?"
     )
-    .get(body.pid, machine) as (PeerIdentity & { id: string }) | null;
+    .get(body.pid, machine, id) as (PeerIdentity & { id: string }) | null;
+
+  deletePeer.run(id);
   if (existing) {
+    deletePeerLease.run(existing.id);
     deletePeer.run(existing.id);
   }
 
@@ -470,6 +643,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     carriedContextNote,
     tier,
     payloadVersion,
+    instanceId,
     body.pid,
     body.cwd,
     body.git_root,
@@ -484,22 +658,108 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     blockedOn,
     blockedSince
   );
-  return { id };
+}
+
+function handleRegister(body: RegisterRequest): RegisterResponse {
+  cleanStalePeers();
+
+  const id = normalizeRequestedId(body.requested_id);
+  if (!id) {
+    throw new HttpError(400, "register requires a valid requested_id");
+  }
+  const payloadVersion = normalizePayloadVersion(body.payload_version);
+  const usesLeaseProtocol = payloadVersion >= 2;
+  const instanceId = usesLeaseProtocol ? normalizeInstanceId(body.instance_id) : null;
+  if (usesLeaseProtocol && !instanceId) {
+    throw new HttpError(400, "payload version 2 requires a valid instance_id");
+  }
+
+  const machine = body.machine || "unknown";
+  const lineage = db
+    .query("SELECT id FROM peers WHERE pid = ? AND machine = ? AND id <> ?")
+    .get(body.pid, machine, id) as { id: string } | null;
+  if (lineage) {
+    const lineageLease = getPeerLease(lineage.id);
+    if (
+      lineageLease &&
+      !leaseIsExpired(lineageLease) &&
+      (!instanceId || lineageLease.instance_id !== instanceId)
+    ) {
+      throw new HttpError(409, "process lineage is owned by another peer lease");
+    }
+  }
+
+  const currentLease = getPeerLease(id);
+  if (!usesLeaseProtocol) {
+    if (currentLease) {
+      throw new HttpError(409, "peer id is owned by a leased runtime");
+    }
+    replacePeerRegistration(body, id, payloadVersion, null);
+    return { id };
+  }
+
+  if (currentLease && !leaseIsExpired(currentLease)) {
+    if (currentLease.instance_id !== instanceId) {
+      return {
+        id,
+        role: "standby",
+        lease_id: null,
+        lease_expires_at: currentLease.expires_at,
+      };
+    }
+
+    replacePeerRegistration(body, id, payloadVersion, instanceId);
+    const leaseExpiresAt = extendLease(currentLease);
+    return {
+      id,
+      role: "owner",
+      lease_id: currentLease.lease_id,
+      lease_expires_at: leaseExpiresAt,
+    };
+  }
+
+  if (currentLease) {
+    deletePeerLease.run(id);
+  }
+  replacePeerRegistration(body, id, payloadVersion, instanceId);
+
+  const now = new Date();
+  const leaseId = crypto.randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + LEASE_TTL_MS).toISOString();
+  insertPeerLease.run(
+    id,
+    instanceId,
+    leaseId,
+    leaseExpiresAt,
+    now.toISOString(),
+    now.toISOString(),
+  );
+  return {
+    id,
+    role: "owner",
+    lease_id: leaseId,
+    lease_expires_at: leaseExpiresAt,
+  };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; found: boolean } {
-  const now = new Date().toISOString();
+  const lease = requireLeaseOwner(body.id, body);
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
   const window = body.context_window !== undefined ? normalizeOptionalInt(body.context_window) : undefined;
   const used = body.context_used !== undefined ? normalizeOptionalInt(body.context_used) : undefined;
   if (window !== undefined || used !== undefined) {
     const result = updateHeartbeatContext.run(now, window ?? null, used ?? null, body.id);
+    if (result.changes > 0 && lease) extendLease(lease, nowDate);
     return { ok: true, found: result.changes > 0 };
   }
   const result = updateLastSeen.run(now, body.id);
+  if (result.changes > 0 && lease) extendLease(lease, nowDate);
   return { ok: true, found: result.changes > 0 };
 }
 
 function handleSetState(body: SetStateRequest): { ok: boolean; found: boolean } {
+  requireLeaseOwner(body.id, body);
   const blockedOn =
     body.blocked_on === undefined ? undefined : normalizeBlockedOn(body.blocked_on);
   const blockedSince =
@@ -528,10 +788,12 @@ function handleSetState(body: SetStateRequest): { ok: boolean; found: boolean } 
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
+  requireLeaseOwner(body.id, body);
   updateSummary.run(body.summary, body.id);
 }
 
 function handleSetNickname(body: SetNicknameRequest): { ok: boolean; error?: string } {
+  requireLeaseOwner(body.id, body);
   const result = updateNickname.run(normalizeNickname(body.nickname), body.id);
   if (result.changes === 0) {
     return { ok: false, error: "peer not found or stale" };
@@ -540,6 +802,7 @@ function handleSetNickname(body: SetNicknameRequest): { ok: boolean; error?: str
 }
 
 function handleSetContext(body: SetContextRequest): void {
+  requireLeaseOwner(body.id, body);
   updateContext.run(
     normalizeOptionalInt(body.context_window),
     normalizeOptionalInt(body.context_used),
@@ -622,6 +885,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
   cleanStalePeers();
+  requireLeaseOwner(body.from_id, body);
   touchPeer(body.from_id);
 
   // Verify target exists
@@ -641,6 +905,9 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+  if (getPeerLease(body.id)) {
+    throw new HttpError(409, "leased peers must use claim-messages");
+  }
   touchPeer(body.id);
   const messages = selectUndelivered.all(body.id) as Message[];
 
@@ -652,7 +919,67 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
-function handleUnregister(body: { id: string }): void {
+const claimMessages = db.transaction(
+  (id: string, leaseId: string, now: string, claimExpiresAt: string): Message[] => {
+    const candidates = selectClaimableMessages.all(id, now) as Message[];
+    const claimed: Message[] = [];
+    const fingerprint = leaseFingerprint(leaseId);
+    for (const message of candidates) {
+      const result = claimMessage.run(claimExpiresAt, fingerprint, message.id, now);
+      if (result.changes === 1) claimed.push(message);
+    }
+    return claimed;
+  },
+);
+
+function handleClaimMessages(body: ClaimMessagesRequest): ClaimMessagesResponse {
+  const lease = requireLeaseOwner(body.id, body);
+  if (!lease) {
+    throw new HttpError(409, "claim-messages requires a leased peer");
+  }
+
+  const now = new Date();
+  const messages = claimMessages(
+    body.id,
+    lease.lease_id,
+    now.toISOString(),
+    new Date(now.getTime() + VISIBILITY_TIMEOUT_MS).toISOString(),
+  );
+  touchPeer(body.id);
+  return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest): AckMessagesResponse {
+  const lease = requireLeaseOwner(body.id, body);
+  if (!lease) {
+    throw new HttpError(409, "ack-messages requires a leased peer");
+  }
+  if (!Array.isArray(body.message_ids)) {
+    throw new HttpError(400, "ack-messages requires message_ids");
+  }
+
+  const messageIds = [
+    ...new Set(
+      body.message_ids.filter(
+        (id): id is number => Number.isSafeInteger(id) && id > 0,
+      ),
+    ),
+  ].slice(0, CLAIM_BATCH_SIZE);
+  let acked = 0;
+  const ackTransaction = db.transaction(() => {
+    const fingerprint = leaseFingerprint(lease.lease_id);
+    for (const messageId of messageIds) {
+      acked += ackClaimedMessage.run(messageId, body.id, fingerprint).changes;
+    }
+  });
+  ackTransaction();
+  touchPeer(body.id);
+  return { ok: true, acked };
+}
+
+function handleUnregister(body: UnregisterRequest): void {
+  requireLeaseOwner(body.id, body);
+  deletePeerLease.run(body.id);
   deletePeer.run(body.id);
 }
 
@@ -701,15 +1028,20 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/claim-messages":
+          return Response.json(handleClaimMessages(body as ClaimMessagesRequest));
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as AckMessagesRequest));
         case "/unregister":
-          handleUnregister(body as { id: string });
+          handleUnregister(body as UnregisterRequest);
           return Response.json({ ok: true });
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return Response.json({ error: msg }, { status: 500 });
+      const status = e instanceof HttpError ? e.status : 500;
+      return Response.json({ error: msg }, { status });
     }
   },
 });
