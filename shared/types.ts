@@ -9,7 +9,6 @@ export interface Peer {
   context_note: string;
   tier: "production" | "staging" | "infrastructure";
   payload_version: number;
-  instance_id: string | null;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -39,6 +38,7 @@ export interface Message {
 export interface RegisterRequest {
   requested_id: string;
   instance_id?: string;
+  lease_id?: string;
   nickname?: string;
   context_window?: number | null;
   context_used?: number | null;

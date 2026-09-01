@@ -564,8 +564,11 @@ function decodeRings(raw: unknown): number[] | null {
   }
 }
 
-function decodePeer(row: Peer & { rings?: unknown }): Peer {
-  return { ...row, rings: decodeRings(row.rings) };
+function decodePeer(
+  row: Peer & { instance_id?: unknown; rings?: unknown },
+): Peer {
+  const { instance_id: _instanceId, ...publicPeer } = row;
+  return { ...publicPeer, rings: decodeRings(row.rings) };
 }
 
 // --- Request handlers ---
@@ -691,9 +694,10 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   const currentLease = getPeerLease(id);
   if (!usesLeaseProtocol) {
-    if (currentLease) {
+    if (currentLease && !leaseIsExpired(currentLease)) {
       throw new HttpError(409, "peer id is owned by a leased runtime");
     }
+    if (currentLease) deletePeerLease.run(id);
     replacePeerRegistration(body, id, payloadVersion, null);
     return { id };
   }
@@ -706,6 +710,9 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
         lease_id: null,
         lease_expires_at: currentLease.expires_at,
       };
+    }
+    if (body.lease_id !== currentLease.lease_id) {
+      throw new HttpError(409, "peer lease conflict");
     }
 
     replacePeerRegistration(body, id, payloadVersion, instanceId);

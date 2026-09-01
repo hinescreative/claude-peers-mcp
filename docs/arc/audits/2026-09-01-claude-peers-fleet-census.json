@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-09-01T06:40:52Z",
+  "scope": "names-only read-only fleet census and isolated delivery probes",
+  "repository": {
+    "requested_path": "/Users/wesleyhines/mcp-servers/claude-peers-mcp",
+    "resolved_path": "/Users/wesleyhines/hines/setup/mcp-servers/claude-peers-mcp",
+    "baseline_commit": "219e9f60cbbb88d9430fc0494ee73da582349d6c",
+    "baseline_branch": "main",
+    "baseline_user_changes_preserved": [
+      "server.ts",
+      "broker.ts.bak-pre-nickname-fix-20260805"
+    ]
+  },
+  "fleet": [
+    {
+      "host": "M3",
+      "reachable": true,
+      "claude_version": "2.1.252",
+      "bun_version": "1.3.11",
+      "channels_enabled": true,
+      "repo_commit": "219e9f6",
+      "repo_dirty_entries": 2,
+      "config_shape": "user scope targets theoldone; project scope defaults to localhost",
+      "active_runtime_census": "Fable and one additional development Claude process each had exactly one server.ts child",
+      "delivery_probe": "broker message consumed; no application-level acknowledgment"
+    },
+    {
+      "host": "PC",
+      "reachable": true,
+      "claude_version": "2.1.198",
+      "bun_version": "1.3.11",
+      "channels_enabled": true,
+      "repo_commit": "3f6ffa5",
+      "repo_dirty_entries": 2,
+      "config_shape": "variant/project registrations present; repo project scope defaults to localhost",
+      "active_runtime_census": "Bilby, Grok, Nagatha, and HAL each had exactly one server.ts child",
+      "delivery_probe": "HAL returned the exact application-level acknowledgment"
+    },
+    {
+      "host": "M2",
+      "reachable": true,
+      "claude_version": "2.1.225",
+      "bun_version": "not available in non-login SSH PATH",
+      "channels_enabled": true,
+      "repo_commit": "c83f6fb",
+      "repo_dirty_entries": 6,
+      "config_shape": "user scope targets a remote broker; project scope defaults to localhost",
+      "active_runtime_census": "Fable and Opus each had exactly one server.ts child; one development Sonnet had no observed child",
+      "delivery_probe": "Tony returned the exact application-level acknowledgment"
+    },
+    {
+      "host": "cheesegrater",
+      "reachable": true,
+      "claude_version": "2.1.252",
+      "bun_version": "not available in non-login SSH PATH",
+      "channels_enabled": true,
+      "repo_commit": "fc26491",
+      "repo_dirty_entries": 22,
+      "config_shape": "user scope targets theoldone; project scope defaults to localhost",
+      "active_runtime_census": "one Claude process had no observed server.ts child",
+      "delivery_probe": "not available; no central peer registration"
+    },
+    {
+      "host": "clarsmini",
+      "reachable": true,
+      "claude_version": "2.1.226",
+      "bun_version": "1.3.14",
+      "channels_enabled": true,
+      "repo_commit": "ba3f149",
+      "repo_dirty_entries": 2,
+      "config_shape": "user scope targets a remote broker; project scope defaults to localhost",
+      "active_runtime_census": "Dood and one additional session each had exactly one server.ts child",
+      "delivery_probe": "broker message consumed; no application-level acknowledgment"
+    },
+    {
+      "host": "theoldone",
+      "reachable": true,
+      "claude_version": "2.1.225",
+      "bun_version": "not available in non-login SSH PATH",
+      "channels_enabled": true,
+      "repo_commit": "c7adea0",
+      "repo_dirty_entries": 10,
+      "config_shape": "user scope targets theoldone; project scope defaults to localhost",
+      "active_runtime_census": "one standard and one development Claude each had one server.ts child; one additional headless child was registered centrally",
+      "delivery_probe": "broker message consumed; no application-level acknowledgment"
+    }
+  ],
+  "controlled_reproductions": [
+    {
+      "name": "current same-name user and project scopes",
+      "result": "Claude 2.1.252 warned about multiple scopes but started one child",
+      "interpretation": "the warning is a diagnostic signal, not proof of duplicate loading on the current release"
+    },
+    {
+      "name": "two distinct MCP registrations targeting the same server.ts with different peer environment",
+      "result": "one Claude parent started two children and the broker exposed two logical peer IDs",
+      "interpretation": "duplicate runtimes remain reproducible when the loader is given distinct registrations"
+    },
+    {
+      "name": "two distinct MCP registrations targeting the same server.ts with the same stable peer environment",
+      "result": "two children remained alive while the broker exposed only the later PID under one stable ID",
+      "interpretation": "the runtimes competed for one mailbox and either runtime could consume or unregister it"
+    }
+  ],
+  "delivery_probes": {
+    "application_ack_proven": ["PC/HAL", "M2/Tony"],
+    "broker_poll_only": ["M3/Fable", "M3/Aesop", "clarsmini/Dood", "theoldone/headless"],
+    "unavailable": ["cheesegrater"],
+    "caveat": "legacy broker delivered=1 means a poll consumed the row before channel injection; it is not proof that Claude received or acted on the message"
+  },
+  "root_cause": {
+    "loader_boundary": "the repository does not spawn a second server.ts process; Claude registration composition or older scope-resolution behavior does",
+    "protocol_boundary": "stable peer identity was also used as runtime ownership, polling authority, and unregister authority",
+    "loss_window": "legacy polling marked rows delivered before the selected runtime attempted channel notification"
+  },
+  "verification_baseline": {
+    "bun_test": "9 passed, 0 failed",
+    "bun_build": "server.ts, broker.ts, and codex-server.ts built successfully for Bun",
+    "typescript": "17 pre-existing errors across broker, tests, codex-direct, dashboard, and server",
+    "dependency_audit": "8 high advisories across four transitive packages",
+    "secret_shape_scan": "0 matching files"
+  },
+  "implemented_fix": {
+    "branch": "fix/peer-runtime-leases",
+    "protocol": "payload v2 stable peer identity plus private process owner lease, fenced standby, visibility claims, and explicit application acknowledgment",
+    "compatibility": "legacy unleased peers retain register, heartbeat, poll, and unregister behavior; an expired v2 lease permits legacy rollback",
+    "privacy": "peer listings omit process instance and lease secrets; diagnostics omit message text",
+    "client_receipt": "channel metadata and manual output expose message IDs; only the ack_message tool finalizes receipt",
+    "tests": [
+      "owner renewal requires the current private lease",
+      "duplicate standby cannot claim or unregister",
+      "standby takeover occurs only after lease expiry",
+      "stale owner is rejected after takeover",
+      "unacknowledged claims are redelivered",
+      "notification write does not acknowledge a message",
+      "manual check does not acknowledge a message",
+      "orphaned standby exits before retry or takeover",
+      "legacy broker and client paths remain compatible"
+    ],
+    "deployment_performed": false
+  },
+  "writes_excluded": [
+    "Claude user configuration",
+    "project MCP configuration",
+    "shell startup files",
+    "launchd and other services",
+    "remote host files and processes",
+    "live broker deployment"
+  ]
+}

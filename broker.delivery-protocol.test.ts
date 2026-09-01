@@ -63,7 +63,11 @@ async function listPeer(id: string) {
     git_root: null,
   });
   expect(response.status).toBe(200);
-  return (response.json as unknown as Array<JsonObject>).find((peer) => peer.id === id);
+  if (!Array.isArray(response.json)) return undefined;
+  return response.json.find(
+    (peer): peer is JsonObject =>
+      typeof peer === "object" && peer !== null && peer.id === id,
+  );
 }
 
 beforeAll(async () => {
@@ -83,7 +87,7 @@ beforeAll(async () => {
       CLAUDE_PEERS_DB: DB,
       CLAUDE_PEERS_TOKEN: "",
       CLAUDE_PEERS_REQUIRE_AUTH: "",
-      CLAUDE_PEERS_LEASE_TTL_MS: "5000",
+      CLAUDE_PEERS_LEASE_TTL_MS: "500",
       CLAUDE_PEERS_VISIBILITY_TIMEOUT_MS: String(VISIBILITY_TIMEOUT_MS),
     },
     stdout: "ignore",
@@ -122,7 +126,10 @@ describe("payload v2 runtime ownership", () => {
     await Bun.sleep(20);
     const renewed = await post(
       "/register",
-      registration("lease-owner-test", "instance-first", 51001),
+      {
+        ...registration("lease-owner-test", "instance-first", 51001),
+        lease_id: first.json.lease_id,
+      },
     );
     expect(renewed.status).toBe(200);
     expect(renewed.json.role).toBe("owner");
@@ -142,7 +149,16 @@ describe("payload v2 runtime ownership", () => {
 
     const visibleOwner = await listPeer("lease-owner-test");
     expect(visibleOwner?.pid).toBe(51001);
-    expect(visibleOwner?.instance_id).toBe("instance-first");
+    expect(visibleOwner?.instance_id).toBeUndefined();
+
+    for (const leaseId of [undefined, "wrong-owner-lease"]) {
+      const stolenRenewal = await post("/register", {
+        ...registration("lease-owner-test", "instance-first", 51099),
+        ...(leaseId ? { lease_id: leaseId } : {}),
+      });
+      expect(stolenRenewal.status).toBe(409);
+      expect(stolenRenewal.json.lease_id).toBeUndefined();
+    }
     expect(Object.hasOwn(visibleOwner ?? {}, "lease_id")).toBe(false);
 
     const standbyClaim = await post("/claim-messages", {
@@ -181,7 +197,6 @@ describe("payload v2 runtime ownership", () => {
     expect(owner.json.role).toBe("owner");
 
     const before = await listPeer("lease-fence-test");
-    expect(before?.instance_id).toBe("instance-owner");
     const beforeLastSeen = before?.last_seen;
     await Bun.sleep(20);
 
@@ -194,7 +209,6 @@ describe("payload v2 runtime ownership", () => {
 
     const afterHeartbeat = await listPeer("lease-fence-test");
     expect(afterHeartbeat?.pid).toBe(52001);
-    expect(afterHeartbeat?.instance_id).toBe("instance-owner");
     expect(afterHeartbeat?.last_seen).toBe(beforeLastSeen);
 
     const staleUnregister = await post("/unregister", {
@@ -206,7 +220,68 @@ describe("payload v2 runtime ownership", () => {
 
     const afterUnregister = await listPeer("lease-fence-test");
     expect(afterUnregister?.pid).toBe(52001);
-    expect(afterUnregister?.instance_id).toBe("instance-owner");
+  });
+
+  test("a standby takes ownership only after the current lease expires", async () => {
+    const first = await post(
+      "/register",
+      registration("lease-takeover-test", "instance-original", 52501),
+    );
+    expect(first.status).toBe(200);
+    expect(first.json.role).toBe("owner");
+
+    const standby = await post(
+      "/register",
+      registration("lease-takeover-test", "instance-standby", 52502),
+    );
+    expect(standby.status).toBe(200);
+    expect(standby.json.role).toBe("standby");
+
+    await Bun.sleep(550);
+
+    const takeover = await post(
+      "/register",
+      registration("lease-takeover-test", "instance-standby", 52502),
+    );
+    expect(takeover.status).toBe(200);
+    expect(takeover.json.role).toBe("owner");
+    expect(typeof takeover.json.lease_id).toBe("string");
+    expect(takeover.json.lease_id).not.toBe(first.json.lease_id);
+
+    const visibleOwner = await listPeer("lease-takeover-test");
+    expect(visibleOwner?.pid).toBe(52502);
+
+    const staleHeartbeat = await post("/heartbeat", {
+      id: "lease-takeover-test",
+      instance_id: "instance-original",
+      lease_id: first.json.lease_id,
+    });
+    expect(staleHeartbeat.status).toBe(409);
+  });
+
+  test("an expired v2 lease permits a legacy rollback without exposing the old lease", async () => {
+    const owner = await post(
+      "/register",
+      registration("lease-legacy-rollback", "instance-v2", 52601),
+    );
+    expect(owner.json.role).toBe("owner");
+    await Bun.sleep(550);
+
+    const legacy = await post("/register", {
+      requested_id: "lease-legacy-rollback",
+      pid: 52602,
+      cwd: "/tmp/lease-legacy-rollback",
+      git_root: null,
+      tty: null,
+      machine: "delivery-protocol-testbox",
+      summary: "legacy rollback",
+    });
+    expect(legacy.status).toBe(200);
+    expect(legacy.json).toEqual({ id: "lease-legacy-rollback" });
+
+    const heartbeat = await post("/heartbeat", { id: "lease-legacy-rollback" });
+    expect(heartbeat.status).toBe(200);
+    expect(heartbeat.json.found).toBe(true);
   });
 });
 
