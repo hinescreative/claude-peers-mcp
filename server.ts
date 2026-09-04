@@ -922,7 +922,10 @@ async function pollAndPushMessages(): Promise<void> {
               from_cwd: sender?.cwd ?? "",
               from_machine: sender?.machine ?? "",
               sent_at: message.sent_at,
-              message_id: message.id,
+              // Claude Code validates channel meta as Record<string, string>;
+              // a numeric id fails with "meta.message_id: Invalid input" and
+              // the whole notification is dropped.
+              message_id: String(message.id),
               acknowledgment: "Call ack_message after reading this channel message.",
             },
           },
