@@ -8,10 +8,15 @@
  *
  * Supports both local and remote brokers via CLAUDE_PEERS_BROKER_URL.
  *
- * Usage:
- *   claude --dangerously-load-development-channels server:claude-peers
+ * Inbound delivery, in order of preference:
+ *   1. Host-session inbox socket (CLAUDE_CODE_MESSAGING_SOCKET, Claude Code
+ *      >= 2.1.224): works in every host, including the desktop app, with no
+ *      launch flag. Each message is posted as a cross-session user message.
+ *   2. claude/channel notification: only honored when the session was launched
+ *      with `claude --dangerously-load-development-channels server:claude-peers`.
+ *   3. check_messages tool: drains the local buffer on demand.
  *
- * With .mcp.json:
+ * Configure as a regular MCP server:
  *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
  */
 
@@ -34,6 +39,7 @@ import {
   getRecentFiles,
 } from "./shared/summarize.ts";
 import { fileURLToPath } from "node:url";
+import { createConnection } from "node:net";
 
 // --- Configuration ---
 
@@ -47,6 +53,18 @@ const DEFAULT_CONTEXT_USED = parseOptionalInt(process.env.CLAUDE_PEERS_CONTEXT_U
 const DEFAULT_CONTEXT_NOTE = process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const CHANNEL_DISABLED = process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "1" ||
   process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "true";
+// Host-session inbox (Claude Code >= 2.1.224 cross-session messaging).
+// Every session binds a Unix socket and exports its path and token into the
+// environment of the MCP servers it spawns. Posting a `user` frame there lands
+// in the host session as a peer interrupt in ANY host, terminal or desktop,
+// with no --dangerously-load-development-channels flag. The session verifies
+// the sender is its own descendant, so this server (a child of the session)
+// is accepted even when the session bypasses permission prompts.
+const HOST_INBOX_SOCKET = process.env.CLAUDE_CODE_MESSAGING_SOCKET ?? "";
+const HOST_INBOX_TOKEN = process.env.CLAUDE_CODE_MESSAGING_TOKEN ?? "";
+const HOST_INBOX_DISABLED = process.env.CLAUDE_PEERS_DISABLE_INBOX === "1" ||
+  process.env.CLAUDE_PEERS_DISABLE_INBOX === "true";
+const HOST_INBOX_WRITE_TIMEOUT_MS = 5000;
 const CHANNEL_RESPONSE_DELAY_MS = Math.max(
   0,
   parseInt(process.env.CLAUDE_PEERS_RESPONSE_DELAY_MS ?? "0", 10) || 0
@@ -343,7 +361,7 @@ const mcp = new Server(
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances across the fleet can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, call ack_message with its message_id after reading it, then RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, acknowledge it, reply using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+IMPORTANT: When you receive a <channel source="claude-peers" ...> message, or a cross-session message wrapping <peer-message source="claude-peers" ...>, call ack_message with its message_id after reading it, then RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, acknowledge it, reply using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Read the from_id, from_summary, from_cwd, and from_machine attributes to understand who sent the message and which machine they're on. Reply by calling send_message with their from_id.
 
@@ -894,6 +912,51 @@ function toBufferedMessage(
   };
 }
 
+function formatInboxMessage(message: Message, sender: SenderDetails | undefined): string {
+  const attr = (v: string) => v.replace(/"/g, "&quot;");
+  const header =
+    `<peer-message source="claude-peers" message_id="${message.id}" from_id="${attr(message.from_id)}"` +
+    ` from_machine="${attr(sender?.machine ?? "")}" from_cwd="${attr(sender?.cwd ?? "")}"` +
+    ` sent_at="${attr(message.sent_at)}">`;
+  const summary = sender?.summary ? `from_summary: ${sender.summary}\n` : "";
+  return (
+    `${header}\n${summary}${message.text}\n</peer-message>\n` +
+    `Peer message from claude-peers. Call ack_message with message_id "${message.id}", ` +
+    `reply with send_message to "${message.from_id}" right away, then resume your work.`
+  );
+}
+
+function postToHostInbox(content: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection({ path: HOST_INBOX_SOCKET });
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(new Error("inbox write timed out"));
+    }, HOST_INBOX_WRITE_TIMEOUT_MS);
+    sock.once("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    sock.once("connect", () => {
+      const frames: string[] = [];
+      if (HOST_INBOX_TOKEN) {
+        frames.push(JSON.stringify({ type: "auth", token: HOST_INBOX_TOKEN }));
+      }
+      frames.push(
+        JSON.stringify({
+          type: "user",
+          priority: "next",
+          message: { role: "user", content },
+        }),
+      );
+      sock.end(frames.join("\n") + "\n", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  });
+}
+
 async function pollAndPushMessages(): Promise<void> {
   if (!myId || CHANNEL_DISABLED || myRole === "standby" || myRole === "unregistered") {
     return;
@@ -911,7 +974,21 @@ async function pollAndPushMessages(): Promise<void> {
         await sleep(CHANNEL_RESPONSE_DELAY_MS);
       }
 
-      try {
+      let delivered = false;
+      if (HOST_INBOX_SOCKET && !HOST_INBOX_DISABLED) {
+        try {
+          await postToHostInbox(formatInboxMessage(message, sender));
+          delivered = true;
+          outcome = claimed.requiresAck
+            ? "inbox-written-awaiting-application-ack"
+            : "inbox-written";
+        } catch (e) {
+          outcome = `inbox-failed (${e instanceof Error ? e.message : String(e)}), trying channel`;
+          log(`Message ${message.id}: ${outcome}`);
+        }
+      }
+
+      if (!delivered) try {
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
