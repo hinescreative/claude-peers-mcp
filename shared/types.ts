@@ -134,6 +134,10 @@ export interface ClaimMessagesResponse {
   messages: Message[];
 }
 
+export interface SubscribeMessagesRequest extends LeaseCredentials {
+  id: PeerId;
+}
+
 export interface AckMessagesRequest extends LeaseCredentials {
   id: PeerId;
   message_ids: number[];

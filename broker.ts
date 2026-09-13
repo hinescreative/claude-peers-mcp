@@ -27,6 +27,7 @@ import type {
   PollMessagesResponse,
   ClaimMessagesRequest,
   ClaimMessagesResponse,
+  SubscribeMessagesRequest,
   AckMessagesRequest,
   AckMessagesResponse,
   UnregisterRequest,
@@ -53,6 +54,24 @@ const VISIBILITY_TIMEOUT_MS =
     ? parsedVisibilityTimeout
     : 30_000;
 const CLAIM_BATCH_SIZE = 100;
+const parsedPushKeepalive = Number(process.env.CLAUDE_PEERS_PUSH_KEEPALIVE_MS ?? "15000");
+const PUSH_KEEPALIVE_MS =
+  Number.isFinite(parsedPushKeepalive) && parsedPushKeepalive > 0
+    ? parsedPushKeepalive
+    : 15_000;
+
+type PushSubscription = {
+  peerId: string;
+  instanceId: string;
+  leaseId: string;
+  leaseFingerprint: string;
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  sentIds: Set<number>;
+  keepalive: ReturnType<typeof setInterval>;
+};
+
+const pushSubscriptions = new Map<string, PushSubscription>();
+const textEncoder = new TextEncoder();
 
 if (REQUIRE_AUTH && !AUTH_TOKEN) {
   console.error("[claude-peers broker] FATAL: CLAUDE_PEERS_REQUIRE_AUTH is set but CLAUDE_PEERS_TOKEN is empty.");
@@ -214,6 +233,7 @@ db.run(`
 `);
 
 function deletePeerAndUndeliveredMessages(id: string): void {
+  closePushSubscription(id);
   db.run("DELETE FROM peer_leases WHERE peer_id = ?", [id]);
   db.run("DELETE FROM peers WHERE id = ?", [id]);
   db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
@@ -377,6 +397,34 @@ const claimMessage = db.prepare(`
   WHERE id = ?
     AND delivered = 0
     AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+`);
+
+const selectPushMessages = db.prepare(`
+  SELECT id, from_id, to_id, text, sent_at, delivered
+  FROM messages
+  WHERE to_id = ?
+    AND delivered = 0
+    AND (
+      claim_expires_at IS NULL
+      OR claim_expires_at <= ?
+      OR claimed_by_lease_fingerprint = ?
+    )
+  ORDER BY sent_at ASC, id ASC
+  LIMIT ${CLAIM_BATCH_SIZE}
+`);
+
+const claimPushMessage = db.prepare(`
+  UPDATE messages
+  SET claim_expires_at = ?,
+      claimed_by_lease_fingerprint = ?,
+      delivery_attempts = delivery_attempts + 1
+  WHERE id = ?
+    AND delivered = 0
+    AND (
+      claim_expires_at IS NULL
+      OR claim_expires_at <= ?
+      OR claimed_by_lease_fingerprint = ?
+    )
 `);
 
 const ackClaimedMessage = db.prepare(`
@@ -908,6 +956,7 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   }
 
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+  queueMicrotask(() => pushAvailableMessages(body.to_id));
   return { ok: true };
 }
 
@@ -981,13 +1030,135 @@ function handleAckMessages(body: AckMessagesRequest): AckMessagesResponse {
   });
   ackTransaction();
   touchPeer(body.id);
+  const subscription = pushSubscriptions.get(body.id);
+  if (subscription?.leaseFingerprint === leaseFingerprint(lease.lease_id)) {
+    for (const messageId of messageIds) subscription.sentIds.delete(messageId);
+  }
+  queueMicrotask(() => pushAvailableMessages(body.id));
   return { ok: true, acked };
 }
 
 function handleUnregister(body: UnregisterRequest): void {
   requireLeaseOwner(body.id, body);
+  closePushSubscription(body.id);
   deletePeerLease.run(body.id);
   deletePeer.run(body.id);
+}
+
+const claimMessagesForPush = db.transaction(
+  (subscription: PushSubscription, now: string, claimExpiresAt: string): Message[] => {
+    const candidates = selectPushMessages.all(
+      subscription.peerId,
+      now,
+      subscription.leaseFingerprint,
+    ) as Message[];
+    const claimed: Message[] = [];
+    for (const message of candidates) {
+      if (subscription.sentIds.has(message.id)) continue;
+      const result = claimPushMessage.run(
+        claimExpiresAt,
+        subscription.leaseFingerprint,
+        message.id,
+        now,
+        subscription.leaseFingerprint,
+      );
+      if (result.changes === 1) claimed.push(message);
+    }
+    return claimed;
+  },
+);
+
+function encodeSseEvent(event: string, data: unknown): Uint8Array {
+  return textEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function closePushSubscription(peerId: string, expected?: PushSubscription): void {
+  const subscription = pushSubscriptions.get(peerId);
+  if (!subscription || (expected && subscription !== expected)) return;
+  pushSubscriptions.delete(peerId);
+  clearInterval(subscription.keepalive);
+  try {
+    subscription.controller.close();
+  } catch {
+    // The HTTP client already closed the response stream.
+  }
+}
+
+function pushAvailableMessages(peerId: string): void {
+  const subscription = pushSubscriptions.get(peerId);
+  if (!subscription) return;
+  try {
+    const lease = requireLeaseOwner(peerId, {
+      instance_id: subscription.instanceId,
+      lease_id: subscription.leaseId,
+    });
+    if (!lease) throw new HttpError(409, "push subscription requires a leased peer");
+    const now = new Date();
+    const messages = claimMessagesForPush(
+      subscription,
+      now.toISOString(),
+      new Date(now.getTime() + VISIBILITY_TIMEOUT_MS).toISOString(),
+    );
+    for (const message of messages) {
+      subscription.controller.enqueue(encodeSseEvent("message", message));
+      subscription.sentIds.add(message.id);
+    }
+  } catch {
+    closePushSubscription(peerId, subscription);
+  }
+}
+
+function handleSubscribeMessages(body: SubscribeMessagesRequest): Response {
+  const lease = requireLeaseOwner(body.id, body);
+  if (!lease) {
+    throw new HttpError(409, "subscribe-messages requires a leased peer");
+  }
+  if (!body.instance_id || !body.lease_id) {
+    throw new HttpError(400, "subscribe-messages requires lease credentials");
+  }
+
+  closePushSubscription(body.id);
+  let subscription: PushSubscription;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      subscription = {
+        peerId: body.id,
+        instanceId: body.instance_id!,
+        leaseId: body.lease_id!,
+        leaseFingerprint: leaseFingerprint(lease.lease_id),
+        controller,
+        sentIds: new Set(),
+        keepalive: setInterval(() => {
+          try {
+            const currentLease = requireLeaseOwner(body.id, body);
+            if (!currentLease) throw new Error("peer lease disappeared");
+            touchPeer(body.id);
+            extendLease(currentLease);
+            controller.enqueue(textEncoder.encode(": keepalive\n\n"));
+          } catch {
+            closePushSubscription(body.id, subscription);
+          }
+        }, PUSH_KEEPALIVE_MS),
+      };
+      pushSubscriptions.set(body.id, subscription);
+      touchPeer(body.id);
+      extendLease(lease);
+      controller.enqueue(encodeSseEvent("ready", { id: body.id }));
+      queueMicrotask(() => pushAvailableMessages(body.id));
+    },
+    cancel() {
+      closePushSubscription(body.id, subscription);
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
 
 // --- HTTP Server ---
@@ -1037,6 +1208,8 @@ Bun.serve({
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/claim-messages":
           return Response.json(handleClaimMessages(body as ClaimMessagesRequest));
+        case "/subscribe-messages":
+          return handleSubscribeMessages(body as SubscribeMessagesRequest);
         case "/ack-messages":
           return Response.json(handleAckMessages(body as AckMessagesRequest));
         case "/unregister":

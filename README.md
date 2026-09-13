@@ -188,6 +188,33 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 CLAUDE_PEERS_TOKEN=your-token bun broker.ts
 ```
 
+## Opt-in server-push subscription
+
+Leased payload-v2 peers may hold one authenticated server-sent event stream instead of
+periodically requesting their inbox. This is a persistent server-push subscription, not
+an HTTP webhook and not long polling.
+
+Open `POST /subscribe-messages` with the normal bearer token, `Accept:
+text/event-stream`, and the current lease credentials:
+
+```json
+{
+  "id": "stable-peer-id",
+  "instance_id": "per-process-instance-id",
+  "lease_id": "broker-issued-owner-lease"
+}
+```
+
+The broker sends queued and newly inserted messages as `event: message` frames. Rows stay
+undelivered in SQLite until the same lease calls `POST /ack-messages`. Reconnecting with
+the same lease immediately replays unacknowledged rows; an ACK prevents later replay.
+The broker sends comment-only keepalives and renews the active lease internally, so an
+idle subscriber makes no periodic inbox or heartbeat requests. A second stream for the
+same peer replaces the first; the owner lease still fences different runtimes.
+
+`CLAUDE_PEERS_PUSH_KEEPALIVE_MS` controls the server-side keepalive interval and defaults
+to 15 seconds.
+
 ## Peer lifecycle
 
 1. **Registration** — MCP server registers with the broker on session start (PID, cwd, git root, machine name)
@@ -280,6 +307,7 @@ Without the API key, Claude sets its own summary via the `set_summary` tool.
 | `CLAUDE_PEERS_TOKEN` | — | Bearer token for authentication |
 | `CLAUDE_PEERS_MACHINE` | `hostname` | Machine name for this peer |
 | `CLAUDE_PEERS_DB` | `~/.claude-peers.db` | SQLite database path (broker only) |
+| `CLAUDE_PEERS_PUSH_KEEPALIVE_MS` | `15000` | Server-side keepalive interval for push subscriptions |
 | `OPENAI_API_KEY` | — | Enables auto-summary generation |
 
 ## Requirements
