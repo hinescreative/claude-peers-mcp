@@ -775,6 +775,14 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
+  // Auto-mesh-status Layer 1: never register blank. If the LLM summary race
+  // produced nothing (failed / keyless / over 3s), register a deterministic
+  // baseline so a fleet roll-call can always tell who is on the mesh. The LLM
+  // summary still wins when it lands (late-retry below) and set_summary still
+  // overrides — this only replaces the "" that used to register as a blank peer.
+  const baselineSummary = `${myNickname} on ${MACHINE_NAME} (${cwdBasename(myCwd)}) — idle, awaiting directive`;
+  const registerSummary = initialSummary || baselineSummary;
+
   // 4. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {
     requested_id: myRequestedId,
@@ -789,10 +797,10 @@ async function main() {
     git_root: myGitRoot,
     tty,
     machine: MACHINE_NAME,
-    summary: initialSummary,
+    summary: registerSummary,
   });
   myId = reg.id;
-  mySummary = initialSummary;
+  mySummary = registerSummary;
   log(`Registered as peer ${myId} on machine ${MACHINE_NAME}`);
 
   // If summary generation is still running, update it when done
