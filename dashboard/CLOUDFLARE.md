@@ -3,10 +3,8 @@
 Local dashboard origin:
 
 ```sh
-CLAUDE_PEERS_BROKER_URL=http://100.69.233.7:7899 \
+CLAUDE_PEERS_BROKER_URL=http://100.108.57.10:7899 \
 CLAUDE_PEERS_TOKEN="$CLAUDE_PEERS_TOKEN" \
-CLAUDE_PEERS_DASHBOARD_CWD=/Users/wesleyhines/Work/active-projects/fleet-rebuild-2026-05 \
-CLAUDE_PEERS_DASHBOARD_GIT_ROOT=/Users/wesleyhines/Work/active-projects/fleet-rebuild-2026-05 \
 bun dashboard-server.ts
 ```
 
@@ -40,7 +38,7 @@ Browser
   -> Cloudflare Access with Google auth
   -> Cloudflare Tunnel
   -> dashboard-server.ts on 127.0.0.1:8799
-  -> broker at http://100.69.233.7:7899
+  -> broker at http://100.108.57.10:7899
 ```
 
 Do not expose the broker directly. The dashboard proxy keeps `CLAUDE_PEERS_TOKEN` server-side.

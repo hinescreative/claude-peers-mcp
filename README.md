@@ -130,7 +130,7 @@ If the broker is remote or authenticated, pass the same environment variables us
 
 ```bash
 codex mcp add codex-peers \
-  --env CLAUDE_PEERS_BROKER_URL=http://100.69.233.7:7899 \
+  --env CLAUDE_PEERS_BROKER_URL=http://100.108.57.10:7899 \
   --env CLAUDE_PEERS_TOKEN=... \
   --env CODEX_PEER_NAME=codex-main \
   -- /Users/wesleyhines/.bun/bin/bun /Users/wesleyhines/mcp-servers/claude-peers-mcp/codex-server.ts
