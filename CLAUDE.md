@@ -19,11 +19,14 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 ## Running
 
 ```bash
-# Start Claude Code with the channel:
-claude --dangerously-load-development-channels server:claude-peers
-
-# Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
+# Register as a regular MCP server (user scope in ~/.claude.json, or .mcp.json):
 # { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+#
+# Inbound pushes arrive through the host session's cross-session inbox socket
+# (CLAUDE_CODE_MESSAGING_SOCKET, Claude Code >= 2.1.224) in every host, desktop
+# included. No launch flag needed. The channel flag is only a fallback for
+# older CLIs:
+claude --dangerously-load-development-channels server:claude-peers
 
 # CLI:
 bun cli.ts status
