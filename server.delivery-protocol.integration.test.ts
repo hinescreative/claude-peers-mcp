@@ -144,6 +144,10 @@ class ClientHarness {
         CLAUDE_PEERS_NICKNAME: "server-protocol-test-client",
         CLAUDE_PEER_ID: "server-protocol-test-peer",
         CLAUDE_PEERS_DISABLE_CHANNEL: "0",
+        // Never inherit the host session's inbox socket: the spawned server
+        // would deliver test fixtures into the developer's live session.
+        CLAUDE_CODE_MESSAGING_SOCKET: "",
+        CLAUDE_CODE_MESSAGING_TOKEN: "",
         CLAUDE_PEERS_RESPONSE_DELAY_MS: "0",
         CLAUDE_PEERS_POLL_INTERVAL_MS: "20",
         CLAUDE_PEERS_HEARTBEAT_INTERVAL_MS: "35",
