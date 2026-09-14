@@ -393,7 +393,7 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List Claude/Codex peers. Returns their ID, nickname, working directory, git repo, machine name, and summary.",
+      "List Claude/Codex peers. Returns their ID, nickname, working directory, git repo, machine name, and summary. Prefer active_only=true when tasking (hides idle no-tty zombies).",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -406,6 +406,11 @@ const TOOLS = [
         include_self: {
           type: "boolean" as const,
           description: "Include this Claude peer in the result.",
+        },
+        active_only: {
+          type: "boolean" as const,
+          description:
+            "If true, hide headless peers whose summary is the default idle/awaiting-directive boilerplate. Recommended for orchestration.",
         },
       },
       required: ["scope"],
@@ -551,9 +556,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "list_peers": {
-      const { scope, include_self } = args as {
+      const { scope, include_self, active_only } = args as {
         scope: "fleet" | "machine" | "directory" | "repo";
         include_self?: boolean;
+        active_only?: boolean;
       };
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
@@ -562,6 +568,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           git_root: myGitRoot,
           machine: MACHINE_NAME,
           exclude_id: include_self ? undefined : myId,
+          active_only: active_only === true,
         });
 
         if (peers.length === 0) {
@@ -569,7 +576,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             content: [
               {
                 type: "text" as const,
-                text: `No other Claude Code instances found (scope: ${scope}).`,
+                text: `No other Claude Code instances found (scope: ${scope}${active_only ? ", active_only" : ""}).`,
               },
             ],
           };
@@ -595,7 +602,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
+              text: `Found ${peers.length} peer(s) (scope: ${scope}${active_only ? ", active_only" : ""}):\n\n${lines.join("\n\n")}`,
             },
           ],
         };
