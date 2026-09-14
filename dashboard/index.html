@@ -3,98 +3,103 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Claude Peers</title>
+    <title>Tailnet</title>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
     <header class="topbar">
       <div>
-        <h1>Claude Peers</h1>
-        <p id="meta">Connecting...</p>
+        <h1>Tailnet</h1>
+        <p id="meta">Loading…</p>
       </div>
       <div class="actions">
-        <select id="scope">
-          <option value="repo">Repo</option>
-          <option value="machine">Machine</option>
-          <option value="fleet">Fleet</option>
-          <option value="directory">Directory</option>
-        </select>
+        <span id="counts" class="counts"></span>
+        <div class="view-toggle" role="tablist">
+          <button id="view-map" type="button" class="on">Map</button>
+          <button id="view-list" type="button">List</button>
+        </div>
         <button id="refresh" type="button">Refresh</button>
       </div>
     </header>
 
     <main>
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Peers</h2>
-          <span id="count">0</span>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>ID</th>
-                <th>Machine</th>
-                <th>TTY</th>
-                <th>PID</th>
-                <th>Context</th>
-                <th>Last Seen</th>
-              </tr>
-            </thead>
-            <tbody id="peers"></tbody>
-          </table>
-        </div>
-      </section>
+      <section id="map" class="map"></section>
 
-      <aside class="panel detail">
-        <div class="panel-head">
-          <h2 id="detail-title">Select Peer</h2>
-          <span id="selected-id"></span>
-        </div>
-
-        <dl id="peer-meta" class="peer-meta"></dl>
-
-        <label>
-          Nickname
-          <div class="row">
-            <input id="nickname" />
-            <button id="save-nickname" type="button">Save</button>
+      <section id="list" class="list-layout hidden">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Peers</h2>
+            <span id="count">0</span>
           </div>
-        </label>
-
-        <label>
-          Summary
-          <textarea id="summary" rows="4"></textarea>
-          <button id="save-summary" type="button">Save Summary</button>
-        </label>
-
-        <div class="context-grid">
-          <label>
-            Window
-            <input id="context-window" inputmode="numeric" />
-          </label>
-          <label>
-            Used
-            <input id="context-used" inputmode="numeric" />
-          </label>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>ID</th>
+                  <th>Machine</th>
+                  <th>TTY</th>
+                  <th>PID</th>
+                  <th>Context</th>
+                  <th>Last seen</th>
+                </tr>
+              </thead>
+              <tbody id="peers"></tbody>
+            </table>
+          </div>
         </div>
-
-        <label>
-          Context Note
-          <input id="context-note" />
-          <button id="save-context" type="button">Save Context</button>
-        </label>
-
-        <label>
-          Message
-          <textarea id="message" rows="5"></textarea>
-          <button id="send-message" type="button">Send Message</button>
-        </label>
-
-        <pre id="status"></pre>
-      </aside>
+        <aside class="panel detail">
+          <div class="panel-head">
+            <h2 id="detail-title">Select a peer</h2>
+            <span id="selected-id"></span>
+          </div>
+          <dl id="peer-meta" class="peer-meta"></dl>
+          <label>
+            Nickname
+            <div class="row">
+              <input id="nickname" />
+              <button id="save-nickname" type="button">Save</button>
+            </div>
+          </label>
+          <label>
+            Summary
+            <textarea id="summary" rows="4"></textarea>
+            <button id="save-summary" type="button">Save summary</button>
+          </label>
+          <div class="context-grid">
+            <label>
+              Window
+              <input id="context-window" inputmode="numeric" />
+            </label>
+            <label>
+              Used
+              <input id="context-used" inputmode="numeric" />
+            </label>
+          </div>
+          <label>
+            Context note
+            <input id="context-note" />
+            <button id="save-context" type="button">Save context</button>
+          </label>
+          <label>
+            Message
+            <textarea id="message" rows="4"></textarea>
+            <button id="send-message" type="button">Send</button>
+          </label>
+          <pre id="status"></pre>
+        </aside>
+      </section>
     </main>
+
+    <dialog id="drawer">
+      <div class="drawer-head">
+        <h2 id="drawer-title">Peer</h2>
+        <button id="drawer-close" type="button">Close</button>
+      </div>
+      <p id="drawer-id" class="mono"></p>
+      <p id="drawer-summary" class="summary"></p>
+      <dl id="drawer-meta" class="peer-meta"></dl>
+    </dialog>
 
     <script src="/app.js" type="module"></script>
   </body>
