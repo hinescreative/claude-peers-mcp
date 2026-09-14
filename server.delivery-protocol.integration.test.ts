@@ -554,6 +554,66 @@ describe("server.ts payload v2 delivery client", () => {
     expect(harness.requestsFor("/ack-messages")[0]!.body.message_ids).toEqual([702]);
   });
 
+  // The delivery notification names a single quoted id, so sessions call
+  // ack_message with {message_id: "703"}. That used to error, nothing was
+  // acked, and the broker redelivered the same message forever.
+  test("ack_message accepts the singular message_id the notification asks for", async () => {
+    const leaseId = "singular-ack-lease";
+    let claimServed = false;
+    const harness = await startClient(
+      (path, body) => {
+        if (path === "/register") {
+          return {
+            json: {
+              id: "server-protocol-test-peer",
+              role: "owner",
+              lease_id: leaseId,
+              lease_expires_at: new Date(Date.now() + 30_000).toISOString(),
+            },
+          };
+        }
+        if (path === "/claim-messages") {
+          if (claimServed) return { json: { messages: [] } };
+          claimServed = true;
+          return {
+            json: {
+              messages: [
+                {
+                  id: 703,
+                  from_id: "singular-sender",
+                  to_id: "server-protocol-test-peer",
+                  text: "singular ack payload",
+                  sent_at: "2026-09-01T12:02:00.000Z",
+                  delivered: false,
+                },
+              ],
+            },
+          };
+        }
+        if (path === "/ack-messages") {
+          return {
+            json: {
+              ok: true,
+              acked: Array.isArray(body.message_ids) ? body.message_ids.length : 0,
+            },
+          };
+        }
+      },
+      { CLAUDE_PEERS_DISABLE_CHANNEL: "1" },
+    );
+
+    await harness.waitForRequest("/register");
+    await harness.callTool("check_messages", {});
+
+    // Exactly the shape the notification text invites: singular, and a string.
+    // Before the fix this errored and no /ack-messages call was ever made.
+    await harness.callTool("ack_message", { message_id: "703" });
+    await harness.waitForRequest("/ack-messages");
+    expect(harness.requestsFor("/ack-messages")[0]!.body.message_ids).toEqual([703]);
+
+    await harness.stop();
+  });
+
   test("a standby whose parent dies during retry sleep cannot take ownership", async () => {
     let registrationCount = 0;
     const harness = await startClient(

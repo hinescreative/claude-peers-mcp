@@ -361,7 +361,7 @@ const mcp = new Server(
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances across the fleet can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, or a cross-session message wrapping <peer-message source="claude-peers" ...>, call ack_message with its message_id after reading it, then RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, acknowledge it, reply using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+IMPORTANT: When you receive a <channel source="claude-peers" ...> message, or a cross-session message wrapping <peer-message source="claude-peers" ...>, call ack_message with its id (message_ids: [<id>]) after reading it, then RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, acknowledge it, reply using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Read the from_id, from_summary, from_cwd, and from_machine attributes to understand who sent the message and which machine they're on. Reply by calling send_message with their from_id.
 
@@ -505,11 +505,15 @@ const TOOLS = [
       properties: {
         message_ids: {
           type: "array" as const,
-          items: { type: "number" as const },
+          items: { type: ["number", "string"] as const },
           description: "Message IDs that this Claude session has received and read.",
         },
+        message_id: {
+          type: ["number", "string"] as const,
+          description:
+            "A single message ID. Accepted because the delivery notification names one id; equivalent to message_ids: [id].",
+        },
       },
-      required: ["message_ids"],
     },
   },
 ];
@@ -519,6 +523,23 @@ const TOOLS = [
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
+
+// Accept every shape a caller plausibly sends for an ack. The delivery
+// notification names a single quoted id ("message_id"), so sessions following it
+// literally sent {message_id: 5738} against a schema that only took
+// {message_ids: [5738]} — the call errored, nothing was ever acked, and the
+// broker redelivered the same message indefinitely. Observed 2026-09-14 as a
+// redelivery loop across several seats; it was misfiled for months as
+// "ack_message fails from Mac seats", which it never was.
+function normalizeAckIds(args: unknown): number[] {
+  const a = (args ?? {}) as { message_ids?: unknown; message_id?: unknown };
+  const source = a.message_ids ?? a.message_id;
+  const raw = source == null ? [] : Array.isArray(source) ? source : [source];
+  const ids = raw
+    .map((v) => (typeof v === "string" ? Number(v.trim()) : v))
+    .filter((v): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0);
+  return [...new Set(ids)];
+}
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
@@ -809,10 +830,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "ack_message": {
-      const { message_ids } = args as { message_ids?: number[] };
-      const ids = Array.isArray(message_ids)
-        ? [...new Set(message_ids.filter((id) => Number.isSafeInteger(id) && id > 0))]
-        : [];
+      const ids = normalizeAckIds(args);
       if (!myId || myRole !== "owner" || !myLeaseId) {
         return {
           content: [{ type: "text" as const, text: "Only the active leased owner can acknowledge messages." }],
@@ -928,7 +946,7 @@ function formatInboxMessage(message: Message, sender: SenderDetails | undefined)
   const summary = sender?.summary ? `from_summary: ${sender.summary}\n` : "";
   return (
     `${header}\n${summary}${message.text}\n</peer-message>\n` +
-    `Peer message from claude-peers. Call ack_message with message_id "${message.id}", ` +
+    `Peer message from claude-peers. Call ack_message with message_ids: [${message.id}], ` +
     `reply with send_message to "${message.from_id}" right away, then resume your work.`
   );
 }
