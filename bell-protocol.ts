@@ -93,11 +93,6 @@ export function parentChanged(startPid: number, currentPid: number): boolean {
   return Number.isInteger(currentPid) && currentPid !== startPid;
 }
 
-// A suffix is a sibling waiting on the base. It asks again every heartbeat.
-export function shouldReaskBase(requestedId: string, effectiveId: string): boolean {
-  return Boolean(requestedId) && requestedId !== effectiveId;
-}
-
 // mcp:uuid:fork is a fork. A plain uuid or mcp:uuid is not.
 export function isForkThread(id: string): boolean {
   return id.replace(/^mcp:/i, "").includes(":");
@@ -107,20 +102,6 @@ export function isForkThread(id: string): boolean {
 export function isWorktreePath(cwd: string | null | undefined): boolean {
   if (!cwd) return false;
   return cwd.replace(/\\/g, "/").includes("/.t3/worktrees/");
-}
-
-const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-export function validSession(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return SESSION_UUID.test(trimmed) ? trimmed : null;
-}
-
-// A bare --resume, or --resume --model, is no session. Only a real uuid counts.
-export function parentSession(command: string): string | null {
-  const match = /--(?:session-id|resume)(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(command);
-  return match?.[1] ?? null;
 }
 
 export function bellPeerId(machine: string): string {
@@ -207,27 +188,6 @@ export function resolveRoute(input: {
   return { error: "no-route" };
 }
 
-export function nicknameDecision(input: {
-  callerId: string;
-  nickname: string;
-  live: { id: string; nickname: string }[];
-  allowlist: Record<string, string>;
-}): { ok: true; clearIds: string[] } | { ok: false; error: string } {
-  const nickname = input.nickname.trim();
-  if (!nickname) return { ok: true, clearIds: [] };
-  const key = nickname.toLowerCase();
-  const reservedOwner = Object.entries(input.allowlist).find(([name]) => name.toLowerCase() === key)?.[1];
-  const holders = input.live.filter(
-    (peer) => peer.id !== input.callerId && peer.nickname.trim().toLowerCase() === key,
-  );
-  if (reservedOwner) {
-    if (input.callerId !== reservedOwner) return { ok: false, error: "nickname reserved" };
-    return { ok: true, clearIds: holders.map((peer) => peer.id) };
-  }
-  if (holders.length) return { ok: false, error: "nickname taken" };
-  return { ok: true, clearIds: [] };
-}
-
 export function loadRouteTable(text: string): Record<string, RouteOverride> {
   const data = JSON.parse(text);
   const table = data.routes ?? data;
@@ -241,19 +201,6 @@ export function loadRouteTable(text: string): Record<string, RouteOverride> {
     routes[id] = { threadId: route?.threadId, tmux: route?.tmux };
   }
   return routes;
-}
-
-export function loadAllowlist(text: string): Record<string, string> {
-  const data = JSON.parse(text);
-  if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("nickname allowlist must be an object");
-  const allowlist: Record<string, string> = {};
-  for (const [name, owner] of Object.entries(data)) {
-    if (typeof name !== "string" || !name.trim() || typeof owner !== "string" || !PEER_ID.test(owner)) {
-      throw new Error("nickname allowlist entries must map a name to a peer id");
-    }
-    allowlist[name.trim()] = owner;
-  }
-  return allowlist;
 }
 
 const WAKE_NAMESPACE = "c3a1e5b0-7d24-4f6a-9b18-2e6d0a4c8f51";

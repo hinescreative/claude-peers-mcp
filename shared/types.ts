@@ -58,7 +58,6 @@ export interface RegisterRequest {
   parent_id?: string | null;
   runtime?: string | null;
   rings?: number[] | string | null;
-  session?: string | null;
 }
 
 export interface RegisterResponse {

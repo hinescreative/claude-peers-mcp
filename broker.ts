@@ -15,21 +15,15 @@
 import { Database } from "bun:sqlite";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { messageContractVersion } from "./shared/message-contract.ts";
 import {
   bellPeerId,
-  loadAllowlist,
   loadBells,
   mergeRuntime,
   needsWake,
-  nicknameDecision,
   normalizeRuntime,
-  parseRuntime,
   pidAlive,
   routeIsFresh,
-  THREAD_ID,
-  validSession,
 } from "./bell-protocol.ts";
 import type {
   RegisterRequest,
@@ -310,8 +304,6 @@ db.run(`
 `);
 try { db.run("ALTER TABLE peer_routes ADD COLUMN requested_id TEXT"); } catch { /* already there */ }
 try { db.run("ALTER TABLE peer_routes ADD COLUMN effective_id TEXT"); } catch { /* already there */ }
-try { db.run("ALTER TABLE peer_routes ADD COLUMN session TEXT"); } catch { /* already there */ }
-try { db.run("ALTER TABLE peer_routes ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"); } catch { /* already there */ }
 try { db.run("ALTER TABLE peers ADD COLUMN requested_id TEXT"); } catch { /* already there */ }
 
 const parsedRouteTtl = Number(process.env.CLAUDE_PEERS_ROUTE_TTL_MS ?? String(7 * 24 * 60 * 60 * 1000));
@@ -340,7 +332,6 @@ function rememberRoute(row: {
   runtime: string | null;
   pid: number | null;
   requestedId?: string | null;
-  session?: string | null;
 }): void {
   if (!row.cwd) return;
   const stable = row.requestedId || row.id;
@@ -351,17 +342,16 @@ function rememberRoute(row: {
     return;
   }
   db.run(
-    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, session, generation, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id, machine) DO UPDATE SET
        cwd = excluded.cwd,
        pid = excluded.pid,
        effective_id = excluded.effective_id,
-       runtime = CASE WHEN peer_routes.generation > excluded.generation THEN peer_routes.runtime ELSE excluded.runtime END,
-       session = CASE WHEN peer_routes.generation > excluded.generation THEN peer_routes.session ELSE COALESCE(peer_routes.session, excluded.session) END,
+       runtime = excluded.runtime,
        requested_id = COALESCE(peer_routes.requested_id, excluded.requested_id),
        updated_at = excluded.updated_at`,
-    [stable, row.machine, row.cwd, row.runtime, row.pid, stable, row.id, row.session ?? null, new Date().toISOString()],
+    [stable, row.machine, row.cwd, row.runtime, row.pid, stable, row.id, new Date().toISOString()],
   );
 }
 
@@ -800,23 +790,9 @@ function replacePeerRegistration(
   const blockedOn = prior?.blocked_on ?? null;
   const blockedSince = prior?.blocked_since ?? null;
 
-  const nickLive = (db.query("SELECT id, nickname, last_seen FROM peers").all() as {
-    id: string;
-    nickname: string;
-    last_seen: string;
-  }[]).filter((row) => !peerIsStale(row));
-  const nick = nicknameDecision({
-    callerId: id,
-    nickname: carriedNickname,
-    live: nickLive,
-    allowlist: nicknameAllowlist(),
-  });
-  const finalNickname = nick.ok ? carriedNickname : "";
-  if (nick.ok) for (const clearId of nick.clearIds) updateNickname.run("", clearId);
-
   insertPeer.run(
     id,
-    finalNickname,
+    carriedNickname,
     carriedContextWindow,
     carriedContextUsed,
     carriedContextNote,
@@ -840,8 +816,7 @@ function replacePeerRegistration(
   const stable = requested ?? id;
   db.run("UPDATE peers SET requested_id = ? WHERE id = ?", [stable, id]);
   if (isBase && body.cwd) {
-    const session = typeof body.session === "string" && body.session.trim() ? body.session.trim().slice(0, 80) : null;
-    rememberRoute({ id, machine, cwd: body.cwd, runtime, pid: body.pid, requestedId: stable, session });
+    rememberRoute({ id, machine, cwd: body.cwd, runtime, pid: body.pid, requestedId: stable });
   }
 }
 
@@ -900,29 +875,15 @@ function liveLeaseFor(id: string): PeerLease | null {
 //   3. Otherwise the base belongs to a different live instance: take our own
 //      suffixed id, lengthening the hash if that exact id is somehow held by
 //      another instance, and give up rather than spin forever.
-function heirSession(base: string, machine: string): string | null {
-  const row = db.query("SELECT session FROM peer_routes WHERE id = ? AND machine = ?").get(base, machine) as { session: string | null } | null;
-  return row?.session || null;
-}
-
-function resolveRegistrationId(base: string, instanceId: string, session: string | null, harness: string | null, machine: string): string {
-  const held = liveLeaseFor(base);
-  const reserved = Object.values(nicknameAllowlist()).includes(base);
-  if (reserved) {
-    const heir = validSession(heirSession(base, machine));
-    // The recorded session is the seat. A new process with that session is the
-    // old one coming back, so it takes the base even while the old lease lives.
-    if (heir !== null && session === heir && harness === "claude") return base;
-  } else if (!held || held.instance_id === instanceId) {
-    return base;
-  }
+function resolveRegistrationId(base: string, instanceId: string): string {
   for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
     const candidate = suffixedPeerId(base, instanceId, length);
     const lease = liveLeaseFor(candidate);
     if (lease && lease.instance_id === instanceId) return candidate;
   }
 
-  if (!reserved && (!held || held.instance_id === instanceId)) return base;
+  const baseLease = liveLeaseFor(base);
+  if (!baseLease || baseLease.instance_id === instanceId) return base;
 
   for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
     const candidate = suffixedPeerId(base, instanceId, length);
@@ -964,12 +925,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   // payload_version 1 clients send no instance_id and cannot be disambiguated,
   // so they keep the pre-existing behaviour exactly.
-  const session = validSession(body.session);
-  if (!usesLeaseProtocol && Object.values(nicknameAllowlist()).includes(id)) {
-    throw new HttpError(409, "reserved id requires a v2 claude session");
-  }
-  const harness = parseRuntime(normalizeRuntime(body.runtime)).harness;
-  const effectiveId = usesLeaseProtocol && instanceId ? resolveRegistrationId(id, instanceId, session, harness, machine) : id;
+  const effectiveId = usesLeaseProtocol && instanceId ? resolveRegistrationId(id, instanceId) : id;
 
   const currentLease = getPeerLease(effectiveId);
   if (!usesLeaseProtocol) {
@@ -981,18 +937,13 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     return { id };
   }
 
-  const heirEvicts = Boolean(
-    currentLease
-    && !leaseIsExpired(currentLease)
-    && currentLease.instance_id !== instanceId
-    && effectiveId === id
-    && harness === "claude"
-    && session
-    && session === validSession(heirSession(id, machine))
-    && Object.values(nicknameAllowlist()).includes(id)
-  );
-  if (currentLease && !leaseIsExpired(currentLease) && !heirEvicts) {
+  if (currentLease && !leaseIsExpired(currentLease)) {
     if (currentLease.instance_id !== instanceId) {
+      // Unreachable: resolveRegistrationId only ever returns an id that is
+      // free, expired, or already this instance's. Reaching this means that
+      // contract broke, so fail loudly instead of silently handing back the
+      // old deaf standby role. `standby` remains in the wire protocol for
+      // clients talking to an older broker.
       throw new HttpError(409, "peer lease conflict");
     }
     if (body.lease_id !== currentLease.lease_id) {
@@ -1089,36 +1040,9 @@ function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
-function nicknameAllowlist(): Record<string, string> {
-  const path = process.env.CLAUDE_PEERS_NICKNAMES
-    ?? fileURLToPath(new URL("./nicknames.json", import.meta.url));
-  try {
-    return loadAllowlist(readFileSync(path, "utf8"));
-  } catch {
-    console.error("[claude-peers broker] nickname allowlist unavailable");
-    return {};
-  }
-}
-
 function handleSetNickname(body: SetNicknameRequest): { ok: boolean; error?: string } {
   requireLeaseOwner(body.id, body);
-  const nickname = normalizeNickname(body.nickname);
-  const rows = db.query("SELECT id, nickname, last_seen FROM peers").all() as {
-    id: string;
-    nickname: string;
-    last_seen: string;
-  }[];
-  const decision = nicknameDecision({
-    callerId: body.id,
-    nickname,
-    live: rows.filter((row) => !peerIsStale(row)),
-    allowlist: nicknameAllowlist(),
-  });
-  if (!decision.ok) {
-    throw new HttpError(409, decision.error);
-  }
-  for (const id of decision.clearIds) updateNickname.run("", id);
-  const result = updateNickname.run(nickname, body.id);
+  const result = updateNickname.run(normalizeNickname(body.nickname), body.id);
   if (result.changes === 0) {
     return { ok: false, error: "peer not found or stale" };
   }
@@ -1137,40 +1061,6 @@ function handleSetRuntime(body: { id?: string; runtime?: unknown } & LeaseCreden
     | null;
   if (row?.cwd) rememberRoute({ id: row.id, machine: row.machine, cwd: row.cwd, runtime, pid: row.pid });
   return { ok: true, found: true, runtime };
-}
-
-function handleSetHeir(body: { base_id?: string; session?: string; thread_id?: string; machine?: string }): { ok: boolean } {
-  const base = typeof body?.base_id === "string" ? body.base_id.trim() : "";
-  const session = validSession(body?.session);
-  const threadId = typeof body?.thread_id === "string" ? body.thread_id.trim() : "";
-  const machine = typeof body?.machine === "string" ? body.machine.trim() : "";
-  if (!base || !session || !THREAD_ID.test(threadId) || !machine) {
-    throw new HttpError(400, "set-heir requires base_id, a uuid session, a thread_id and a machine");
-  }
-  if (!Object.values(nicknameAllowlist()).includes(base)) throw new HttpError(403, "set-heir is only for a reserved id");
-  const other = db.query("SELECT machine FROM peer_routes WHERE id = ? AND machine <> ?").get(base, machine) as { machine: string } | null;
-  if (other) {
-    console.error(`[claude-peers broker] route ${base} belongs to ${other.machine}; refused set-heir from ${machine}`);
-    throw new HttpError(409, "route belongs to another machine");
-  }
-  const runtime = `claude:t3:${threadId}`;
-  const now = new Date().toISOString();
-  const rotate = db.transaction(() => {
-    db.run(
-      `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, session, generation, updated_at)
-       VALUES (?, ?, '', ?, null, ?, ?, ?, 1, ?)
-       ON CONFLICT(id, machine) DO UPDATE SET
-         runtime = excluded.runtime,
-         session = excluded.session,
-         generation = peer_routes.generation + 1,
-         updated_at = excluded.updated_at`,
-      [base, machine, runtime, base, base, session, now],
-    );
-    db.run("UPDATE peers SET runtime = NULL WHERE id = ? AND machine = ?", [base, machine]);
-    db.run("DELETE FROM peer_leases WHERE peer_id = ?", [base]);
-  });
-  rotate();
-  return { ok: true };
 }
 
 function handleSetContext(body: SetContextRequest): void {
@@ -1573,8 +1463,6 @@ Bun.serve({
           return Response.json(await handleSendMessage(body as SendMessageRequest));
         case "/set-runtime":
           return Response.json(handleSetRuntime(body as { id?: string; runtime?: unknown } & LeaseCredentials));
-        case "/set-heir":
-          return Response.json(handleSetHeir(body as { base_id?: string; session?: string }));
         case "/reap-dead": {
           const reapBody = body as { id?: string; peer_id?: string; pid?: number; machine?: string } & LeaseCredentials;
           const reaped = handleReapDead(reapBody);

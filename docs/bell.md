@@ -14,15 +14,9 @@ A running turn is `queue_after_active`. Anything else is `start_immediately`. A 
 
 A cwd match is only for a path under `~/.t3/worktrees/` with exactly one live thread that is not a fork. T3 makes one worktree per thread, so that is unique. A project root, including the Assistant, resolves only by an explicit route.
 
-An unreserved id is first-come: whoever registers while the base is free holds it. A reserved id is granted only to a v2 Claude-harness process whose session is a uuid equal to the recorded heir. That session takes the base at once, even if an older process still holds a live lease. No heir recorded means nobody gets the base. A v1 caller or a sessionless caller never gets it. A suffix cannot take the reserved nickname.
+An id is first-come: whoever registers while the base is free holds it. A second process in the same directory gets a suffixed id. A suffixed id belongs to one process. Mail addressed to a suffix after that process exits is not recoverable. Senders target a stable id or a nickname. A suffix never reads or writes the base route, and a route is not moved to another machine.
 
-A suffixed id belongs to one process. Mail addressed to a suffix after that process exits is not recoverable. Senders target a stable id or a nickname.
-
-When the Assistant moves to a new thread, one call rotates the heir, the route, the old binding and the old lease. A later reap cannot put the old thread back:
-
-`curl -s -H "Authorization: Bearer $CLAUDE_PEERS_TOKEN" -H "content-type: application/json" -d '{"base_id":"mac-assistant-claude-no-tty","session":"<session-uuid>","thread_id":"mcp:<uuid>:fork","machine":"mac"}' "$CLAUDE_PEERS_BROKER_URL/set-heir"`
-
-The bearer is the fleet token. Spoofing a session uuid is the same trust as holding that bearer. A suffix never reads or writes the base route, and a route is not moved to another machine.
+Nicknames are whatever the seat sets, the same as main. Reserved names and `set-heir` are not in this branch.
 
 Nothing sets step 2 today. `server.ts` and `codex-server.ts` will register `claude:t3:<id>` or `codex:t3:<id>` if `CLAUDE_PEERS_THREAD_ID` or `T3_THREAD_ID` is in the environment. T3 does not put either there. The tool that sets it by hand is `set_route` with `thread_id`. No AGENTS.md line calls it, and a seat cannot see its own thread id from the environment, so a startup line would have nothing to pass. Until something records the id, a root-cwd seat is a `routes.json` entry.
 
@@ -41,16 +35,20 @@ A route is kept for 7 days (`CLAUDE_PEERS_ROUTE_TTL_MS`). A thread id in a route
 
 ## Deploy order
 
-Do these in order. Skipping the heir step lets the next Assistant registration lose the base.
+theoldone's broker is not this branch. On 2026-10-22 it was still the tree at b112981 (PR #2, multi-token), seven commits behind main. PR #3 (redelivery, claims, leases) and PR #4 are merged on main and were not deployed. The broker process there started 2026-10-19 at 10:25 PM. theoldone also has a local grok-edge.ts patch and untracked files: lead-wake-edge.ts, dispatch.mjs, protocol.mjs, and butler-inbox-edge.ts. butler-inbox-edge.ts matches main.
 
-1. Merge.
-2. Update the Mac Claude peers client.
-3. Run the set-heir curl above for `mac-assistant-claude-no-tty` with the Assistant's current session and thread, before its next release.
-4. Restart theoldone's broker.
+The lease and claim checks in the wake decision do nothing until theoldone is running main.
+
+Do these in order, at a quiet moment. Do not load the Mac bell before that broker is on main.
+
+1. On theoldone, remove the untracked butler-inbox-edge.ts. It is the same file as main's, and a pull will not replace an untracked copy.
+2. Bring theoldone's broker checkout to main, so PR #3 and PR #4 are what is running. Restart the broker once.
+3. Replace theoldone's local grok-edge.ts patch with the matcher in this PR.
+4. Copy theoldone's lead-wake routes.json, which has Shaw, into the Mac bell's routes.json. A seat that wakes today keeps waking.
 5. Load the Mac bell.
-6. Retire theoldone's grok-edge patch.
+6. Leave lead-wake-edge.ts running on theoldone until the bell has woken Shaw's lead once. Then disable that unit.
 
-`~/bin/peers` is an installed copy of `cli.ts`. Reinstall it from `cli.ts` after the client update. Do not edit that copy from a worktree.
+`~/bin/peers` is an installed copy of `cli.ts`. Reinstall it from `cli.ts` after the Mac client update. Do not edit that copy from a worktree.
 
 ## Rollback
 
