@@ -136,8 +136,8 @@ test("the bell refusing a route is returned to the sender", async () => {
   bellMode = "no-route";
   expect((await post("/register", seat("codex-lost", { runtime: "codex" }))).status).toBe(200);
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "codex-lost", text: "SECRET-MAIL lost" });
-  expect(sent.json.ok).toBe(false);
-  expect(sent.json.error).toBe("no-route");
+  expect(sent.json.ok).toBe(true);
+  expect(sent.json.wake).toBe("no-route");
   expect(sent.json.message_id).toBeGreaterThan(0);
   bellMode = "ok";
 });
@@ -154,4 +154,125 @@ test("a live nickname cannot be taken, and assistant stays reserved", async () =
   expect(reserved.json.error).toBe("nickname reserved");
   expect((await post("/register", seat("mac-assistant-claude-no-tty", { pid: 9 }))).status).toBe(200);
   expect((await post("/set-nickname", { id: "mac-assistant-claude-no-tty", nickname: "assistant" })).json.ok).toBe(true);
+});
+
+test("registration cannot take a reserved or held nickname", async () => {
+  const owner = await post("/register", seat("mac-assistant-claude-no-tty", { nickname: "assistant" }));
+  expect(owner.status).toBe(200);
+  const impostor = await post("/register", seat("mac-impostor", { nickname: "assistant", pid: process.ppid || process.pid }));
+  expect(impostor.status).toBe(200);
+  const list = await post("/list-peers", { scope: "fleet", cwd: "/work/only", git_root: null });
+  const rows = list.json as { id: string; nickname: string }[];
+  expect(rows.find((row) => row.id === "mac-impostor")?.nickname).toBe("");
+  expect(rows.find((row) => row.id === "mac-assistant-claude-no-tty")?.nickname).toBe("assistant");
+});
+
+test("a restarted suffixed seat keeps the mail, and the reserved owner reclaims the base", async () => {
+  const sleeps = [Bun.spawn(["sleep", "30"]), Bun.spawn(["sleep", "30"]), Bun.spawn(["sleep", "30"])];
+  const pids = sleeps.map((child) => child.pid);
+  try {
+  const holder = await post("/register", {
+    ...seat("mac-box", { pid: pids[0] }),
+    instance_id: "holder-instance-01",
+    payload_version: 2,
+    cwd: "/work/box",
+  });
+  expect(holder.json.id).toBe("mac-box");
+  const first = await post("/register", {
+    ...seat("mac-box", { pid: pids[1] }),
+    instance_id: "suffix-instance-02",
+    payload_version: 2,
+    cwd: "/work/box",
+  });
+  expect(String(first.json.id).startsWith("mac-box-")).toBe(true);
+  const sent = await post("/send-message", { from_id: "mac-sender", to_id: first.json.id, text: "kept-mail" });
+  expect(sent.json.ok).toBe(true);
+  await post("/unregister", { id: first.json.id, instance_id: "suffix-instance-02", lease_id: first.json.lease_id });
+  const next = await post("/register", {
+    ...seat("mac-box", { pid: pids[1] }),
+    instance_id: "suffix-instance-03",
+    payload_version: 2,
+    cwd: "/work/box",
+  });
+  expect(next.json.id).not.toBe(first.json.id);
+  const polled = await post("/claim-messages", {
+    id: next.json.id, instance_id: "suffix-instance-03", lease_id: next.json.lease_id,
+  });
+  expect((polled.json.messages as { text: string }[]).some((message) => message.text === "kept-mail")).toBe(true);
+
+  const old = await post("/register", {
+    ...seat("mac-assistant-claude-no-tty", { pid: process.pid, cwd: "/tmp/assistant" }),
+    instance_id: "assistant-old-01",
+    payload_version: 2,
+    nickname: "Grok",
+  });
+  expect(old.json.id).toBe("mac-assistant-claude-no-tty");
+  const respawn = await post("/register", {
+    ...seat("mac-assistant-claude-no-tty", { pid: process.ppid || process.pid, cwd: "/tmp/assistant" }),
+    instance_id: "assistant-new-02",
+    payload_version: 2,
+    nickname: "Grok",
+  });
+  expect(String(respawn.json.id).startsWith("mac-assistant-claude-no-tty-")).toBe(true);
+  const denied = await post("/set-nickname", {
+    id: respawn.json.id, nickname: "assistant", instance_id: "assistant-new-02", lease_id: respawn.json.lease_id,
+  });
+  expect(denied.status).toBe(409);
+  await post("/unregister", { id: old.json.id, instance_id: "assistant-old-01", lease_id: old.json.lease_id });
+  const reclaimed = await post("/register", {
+    ...seat("mac-assistant-claude-no-tty", { pid: process.ppid || process.pid, cwd: "/tmp/assistant" }),
+    instance_id: "assistant-new-02",
+    lease_id: respawn.json.lease_id,
+    payload_version: 2,
+    nickname: "Grok",
+  });
+  expect(reclaimed.json.id).toBe("mac-assistant-claude-no-tty");
+  const claimed = await post("/set-nickname", {
+    id: reclaimed.json.id, nickname: "assistant", instance_id: "assistant-new-02", lease_id: reclaimed.json.lease_id,
+  });
+  expect(claimed.json.ok).toBe(true);
+  } finally {
+    for (const child of sleeps) child.kill();
+  }
+});
+
+test("a failed wake stays accepted, and the same client id retries the wake", async () => {
+  bellMode = "no-route";
+  const first = await post("/send-message", {
+    from_id: "mac-sender", to_id: "codex-only", text: "once", client_message_id: "retry-1",
+  });
+  expect(first.json.ok).toBe(true);
+  expect(first.json.wake).toBe("no-route");
+  const id = first.json.message_id;
+  bellMode = "ok";
+  const again = await post("/send-message", {
+    from_id: "mac-sender", to_id: "codex-only", text: "once", client_message_id: "retry-1",
+  });
+  expect(again.json.ok).toBe(true);
+  expect(again.json.wake).toBe("sent");
+  expect(again.json.message_id).toBe(id);
+  expect(again.json.duplicate).toBe(true);
+});
+
+test("an expired owner lease is woken even though the row and the pid are alive", async () => {
+  const sleeper = Bun.spawn(["sleep", "30"]);
+  const reg = await post("/register", {
+    ...seat("mac-lease-dead", { runtime: "claude", pid: sleeper.pid }),
+    instance_id: "lease-dead-instance",
+    payload_version: 2,
+  });
+  expect(reg.json.role).toBe("owner");
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(DB);
+  db.run("UPDATE peer_leases SET expires_at = ? WHERE peer_id = ?", ["2000-01-01T00:00:00.000Z", "mac-lease-dead"]);
+  db.close();
+  const before = wakes.length;
+  const sent = await post("/send-message", { from_id: "mac-sender", to_id: "mac-lease-dead", text: "lease-mail" });
+  try {
+    expect(sent.json.ok).toBe(true);
+    expect(sent.json.wake).toBe("sent");
+    expect(wakes.length).toBe(before + 1);
+  } finally {
+    sleeper.kill();
+  }
 });

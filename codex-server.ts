@@ -24,6 +24,7 @@ import type {
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
 import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { THREAD_ID, parentChanged } from "./bell-protocol.ts";
 
 type ClaudePeersEnv = {
   CLAUDE_PEERS_BROKER_URL?: string;
@@ -72,19 +73,19 @@ let myContextNote = process.env.CODEX_PEER_CONTEXT_NOTE ?? process.env.CLAUDE_PE
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 const START_PARENT_PID = process.ppid;
-const THREAD_ID = /^(?:mcp:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+let myBoundThread: string | null = null;
 
 function registeredRuntime(): string {
-  const thread = (process.env.CLAUDE_PEERS_THREAD_ID ?? process.env.T3_THREAD_ID ?? "").trim();
-  return THREAD_ID.test(thread) ? `codex:t3:${thread}` : "codex";
+  const fromEnv = (process.env.CLAUDE_PEERS_THREAD_ID ?? process.env.T3_THREAD_ID ?? "").trim();
+  const thread = THREAD_ID.test(fromEnv) ? fromEnv : myBoundThread;
+  return thread ? `codex:t3:${thread}` : "codex";
 }
 
 function parentProcessChanged(): boolean {
-  if (!START_PARENT_PID || START_PARENT_PID === 1) return false;
   try {
     const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
     const currentParent = Number(new TextDecoder().decode(proc.stdout).trim());
-    return Number.isInteger(currentParent) && currentParent !== START_PARENT_PID;
+    return parentChanged(START_PARENT_PID, currentParent);
   } catch {
     return false;
   }
@@ -504,7 +505,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       await ensureRegistered();
       if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet." }], isError: true };
-      await brokerFetch("/set-runtime", { id: myId, runtime: `codex:t3:${threadId}` });
+      myBoundThread = threadId;
+      await brokerFetch("/set-runtime", { id: myId, runtime: registeredRuntime() });
       return { content: [{ type: "text" as const, text: "Route registered. A peers message can wake this thread." }] };
     }
 

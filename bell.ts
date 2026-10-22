@@ -3,7 +3,7 @@
 // channel, or when its process is gone. This starts that seat's thread, or
 // rings a tmux session. The mailbox text stays on the broker.
 import { timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { bellPeerId, loadRouteTable, pidAlive, planWake, type RouteOverride } from "./bell-protocol.ts";
 import { dispatchToThread, readShell, type T3Auth } from "./bell-dispatch.ts";
@@ -22,6 +22,11 @@ function readJsonFile(path: string | undefined): string | null {
 }
 
 export function loadT3Auth(path: string): T3Auth {
+  const info = statSync(path);
+  if ((info.mode & 0o777) !== 0o600) throw new Error("T3 credential file must be mode 600");
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+    throw new Error("T3 credential file must be owned by this user");
+  }
   const auth = JSON.parse(readFileSync(path, "utf8"));
   if (!auth.baseUrl || !auth.token) throw new Error("T3 credential file is incomplete");
   return { baseUrl: auth.baseUrl, token: auth.token, environmentId: auth.environmentId };
@@ -100,7 +105,7 @@ export async function start() {
   async function wake(body: any) {
     const toId = typeof body?.to_id === "string" ? body.to_id : "";
     if (!PEER_ID_RE.test(toId)) return { ok: false, error: "no-route" };
-    let threads: { id: string; worktreePath: string | null; archivedAt: string | null; latestTurnState: string | null }[] = [];
+    let threads: { id: string; worktreePath: string | null; archivedAt: string | null; latestTurnState: string | null }[] | undefined;
     let shellFailed = false;
     try {
       threads = await readShell(loadT3Auth(t3Path));

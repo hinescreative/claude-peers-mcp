@@ -43,6 +43,7 @@ import { createConnection } from "node:net";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { THREAD_ID } from "./bell-protocol.ts";
 
 // --- Configuration ---
 
@@ -300,6 +301,7 @@ let myContextWindow: number | null = DEFAULT_CONTEXT_WINDOW;
 let myContextUsed: number | null = DEFAULT_CONTEXT_USED;
 let myContextNote = DEFAULT_CONTEXT_NOTE;
 let mySummary = "";
+let myBoundThread: string | null = null;
 let myRequestedId = "";
 type RegistrationRole = "unregistered" | "owner" | "standby" | "legacy";
 let myRole: RegistrationRole = "unregistered";
@@ -688,14 +690,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "set_route": {
       const threadId = String((args as { thread_id?: string }).thread_id ?? "").trim();
-      if (!/^(?:mcp:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) {
+      if (!THREAD_ID.test(threadId)) {
         return { content: [{ type: "text" as const, text: "thread_id must be a T3 thread id" }], isError: true };
       }
       if (!myId || !canMutateBroker()) {
         return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
       }
+      myBoundThread = threadId;
       try {
-        await brokerFetch("/set-runtime", { id: myId, runtime: `claude:t3:${threadId}`, ...leaseCredentials() });
+        await brokerFetch("/set-runtime", { id: myId, runtime: registeredRuntime(), ...leaseCredentials() });
         return { content: [{ type: "text" as const, text: "Route registered. A peers message can wake this thread." }] };
       } catch (e) {
         return { content: [{ type: "text" as const, text: `Error setting route: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
@@ -1223,10 +1226,12 @@ function registrationPayload(summary: string) {
 }
 
 function registeredRuntime(): string {
-  const thread = (process.env.CLAUDE_PEERS_THREAD_ID ?? process.env.T3_THREAD_ID ?? "").trim();
-  return /^(?:mcp:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(thread)
-    ? `claude:t3:${thread}`
-    : "claude";
+  // CHANNEL_DISABLED never reaches the inbox socket. Advertising "claude" would
+  // tell the broker this seat has push when it only has a doorbell file.
+  const harness = CHANNEL_DISABLED ? "poll" : "claude";
+  const fromEnv = (process.env.CLAUDE_PEERS_THREAD_ID ?? process.env.T3_THREAD_ID ?? "").trim();
+  const thread = THREAD_ID.test(fromEnv) ? fromEnv : myBoundThread;
+  return thread ? `${harness}:t3:${thread}` : harness;
 }
 
 function applyRegistration(registration: RegisterResponse): void {

@@ -2,12 +2,14 @@
 // "who gets a wake" and "which thread" stay the same in tests and in production.
 
 export const WAKE_TEXT = "peers mail waiting; run check_messages";
-export const NO_PUSH = new Set(["codex", "cursor", "opencode", "grok"]);
-const HARNESS = "claude|codex|cursor|opencode|grok|bell";
+export const NO_PUSH = new Set(["codex", "cursor", "opencode", "grok", "poll"]);
+const HARNESS = "claude|codex|cursor|opencode|grok|bell|poll";
 const UUID = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
-export const THREAD_ID = new RegExp(`^(?:mcp:)?${UUID}$`);
-const THREAD = `(?:mcp:)?${UUID}`;
-const RUNTIME = new RegExp(`^(?:t3:(?<bare>${THREAD})|(?<harness>${HARNESS})(?::t3:(?<bound>${THREAD}))?)$`);
+// T3 thread ids are a uuid, an optional mcp: prefix, and an optional label
+// such as :fork. mcp:3e3e7dbd-4ab2-454b-8ae2-cebf0a87193c:fork is a real one.
+const THREAD = `(?:mcp:)?${UUID}(?::[A-Za-z0-9_-]{1,32})?`;
+export const THREAD_ID = new RegExp(`^${THREAD}$`, "i");
+const RUNTIME = new RegExp(`^(?:t3:(?<bare>${THREAD})|(?<harness>${HARNESS})(?::t3:(?<bound>${THREAD}))?)$`, "i");
 const LEGACY_RUNTIME = /^[a-zA-Z0-9_-]{1,32}$/;
 const TMUX_TARGET = /^[a-zA-Z0-9_.:@=-]{1,80}$/;
 const PEER_ID = /^[a-zA-Z0-9_-]{3,64}$/;
@@ -42,7 +44,7 @@ export function parseRuntime(value: string | null | undefined): { harness: strin
 export function normalizeRuntime(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
-  if (!trimmed || trimmed.length > 80) return null;
+  if (!trimmed || trimmed.length > 96) return null;
   const parsed = parseRuntime(trimmed);
   if (parsed.harness || parsed.threadId) return trimmed;
   return LEGACY_RUNTIME.test(trimmed) ? trimmed : null;
@@ -54,10 +56,40 @@ export function isNoPush(runtime: string | null | undefined): boolean {
 }
 
 // A wake is required when nobody is sitting on a push channel: the row is gone
-// or stale, or the harness that registered has no messaging socket.
-export function needsWake(input: { present: boolean; stale: boolean; runtime: string | null }): boolean {
-  if (!input.present || input.stale) return true;
+// or stale, the v2 owner lease is dead, or the harness has no messaging socket.
+export function needsWake(input: {
+  present: boolean;
+  stale: boolean;
+  runtime: string | null;
+  ownerLive?: boolean;
+}): boolean {
+  if (!input.present || input.stale || input.ownerLive === false) return true;
   return isNoPush(input.runtime);
+}
+
+// Keep a thread id that was bound earlier when a refresh only names the harness.
+export function mergeRuntime(incoming: string | null, prior: string | null): string | null {
+  const next = parseRuntime(incoming);
+  const previous = parseRuntime(prior);
+  if (next.harness && !next.threadId && previous.threadId) return `${next.harness}:t3:${previous.threadId}`;
+  return incoming ?? prior;
+}
+
+export function routeIsFresh(updatedAt: string | null | undefined, now = Date.now(), ttlMs = 7 * 24 * 60 * 60 * 1000): boolean {
+  const at = Date.parse(updatedAt ?? "");
+  return Number.isFinite(at) && now - at <= ttlMs;
+}
+
+// Retry the wake only when a re-read shows a turn actually running. A lost
+// response is not that, and must not send a second command.
+export function retryDispatch(mode: string, turnState: string | null | undefined): "queue" | "abort" {
+  if (mode !== "start_immediately") return "abort";
+  return turnState === "running" ? "queue" : "abort";
+}
+
+export function parentChanged(startPid: number, currentPid: number): boolean {
+  if (!startPid || startPid === 1) return false;
+  return Number.isInteger(currentPid) && currentPid !== startPid;
 }
 
 export function bellPeerId(machine: string): string {
@@ -108,21 +140,34 @@ export function resolveRoute(input: {
   overrides?: Record<string, RouteOverride>;
   threads?: ThreadFact[];
 }): ResolvedRoute {
+  const threads = input.threads;
+  const usable = (id: string): ResolvedRoute | { error: "no-route" } | null => {
+    if (!THREAD_ID.test(id)) return null;
+    if (!threads) return { kind: "thread", threadId: id };
+    const found = threads.find((thread) => thread.id === id);
+    if (!found || found.archivedAt) return { error: "no-route" };
+    return { kind: "thread", threadId: id };
+  };
+
   const override = input.peerId ? input.overrides?.[input.peerId] : undefined;
-  if (override?.threadId && THREAD_ID.test(override.threadId)) {
-    return { kind: "thread", threadId: override.threadId };
+  if (override?.threadId) {
+    const decided = usable(override.threadId);
+    if (decided) return decided;
   }
   if (override?.tmux && TMUX_TARGET.test(override.tmux)) {
     return { kind: "tmux", target: override.tmux };
   }
 
   const fromRuntime = parseRuntime(input.runtime).threadId;
-  if (fromRuntime && THREAD_ID.test(fromRuntime)) {
-    return { kind: "thread", threadId: fromRuntime };
+  if (fromRuntime) {
+    const decided = usable(fromRuntime);
+    if (decided) return decided;
   }
 
-  const threads = (input.threads ?? []).filter((thread) => !thread.archivedAt && thread.worktreePath);
-  const matches = threads.filter((thread) => samePath(thread.worktreePath, input.cwd));
+  const live = (threads ?? []).filter((thread) => !thread.archivedAt && thread.worktreePath);
+  const archivedSame = (threads ?? []).some((thread) => thread.archivedAt && samePath(thread.worktreePath, input.cwd));
+  if (archivedSame) return { error: "no-route" };
+  const matches = live.filter((thread) => samePath(thread.worktreePath, input.cwd));
   const only = matches.length === 1 ? matches[0] : undefined;
   if (only && THREAD_ID.test(only.id)) return { kind: "thread", threadId: only.id };
   return { error: "no-route" };
@@ -142,7 +187,11 @@ export function nicknameDecision(input: {
     (peer) => peer.id !== input.callerId && peer.nickname.trim().toLowerCase() === key,
   );
   if (reservedOwner) {
-    if (input.callerId !== reservedOwner) return { ok: false, error: "nickname reserved" };
+    const exact = input.callerId === reservedOwner;
+    const suffix = input.callerId.startsWith(`${reservedOwner}-`);
+    const baseLive = input.live.some((peer) => peer.id === reservedOwner);
+    // A suffixed respawn may take the name back only after the base seat is gone.
+    if (!exact && !(suffix && !baseLive)) return { ok: false, error: "nickname reserved" };
     return { ok: true, clearIds: holders.map((peer) => peer.id) };
   }
   if (holders.length) return { ok: false, error: "nickname taken" };

@@ -5,11 +5,15 @@ import {
   loadAllowlist,
   loadBells,
   loadRouteTable,
+  mergeRuntime,
   needsWake,
   nicknameDecision,
   normalizeRuntime,
+  parentChanged,
   planDispatch,
   resolveRoute,
+  retryDispatch,
+  routeIsFresh,
 } from "./bell-protocol.ts";
 
 const THREAD = "mcp:36a41ff7-8eef-49ab-a947-55027c14f468";
@@ -92,6 +96,73 @@ test("nicknames are unique among live peers, and assistant is reserved", () => {
   });
   expect(takeback).toEqual({ ok: true, clearIds: ["mac-impostor"] });
   expect(nicknameDecision({ callerId: "mac-new", nickname: "   ", live, allowlist })).toEqual({ ok: true, clearIds: [] });
+});
+
+const FORK = "mcp:3e3e7dbd-4ab2-454b-8ae2-cebf0a87193c:fork";
+
+test("a T3 fork id is a thread id, in a route file and in a runtime", () => {
+  const routes = loadRouteTable(JSON.stringify({ routes: { "mac-assistant-claude-no-tty": { threadId: FORK } } }));
+  expect(routes["mac-assistant-claude-no-tty"]?.threadId).toBe(FORK);
+  expect(normalizeRuntime(`claude:t3:${FORK}`)).toBe(`claude:t3:${FORK}`);
+  expect(resolveRoute({ peerId: "mac-assistant-claude-no-tty", overrides: routes, threads: [{ id: FORK }] })).toEqual({
+    kind: "thread",
+    threadId: FORK,
+  });
+});
+
+test("an archived thread is not a route, and its cwd does not fall through to a survivor", () => {
+  const original = "mcp:11111111-1111-4111-8111-111111111111";
+  const survivor = "mcp:22222222-2222-4222-8222-222222222222:fork";
+  const threads = [
+    { id: original, worktreePath: "/work/assistant", archivedAt: "2026-10-22T00:00:00Z" },
+    { id: survivor, worktreePath: "/work/assistant" },
+  ];
+  const byPath = resolveRoute({ peerId: "mac-assistant-claude-no-tty", cwd: "/work/assistant", threads });
+  const byRuntime = resolveRoute({ peerId: "mac-assistant-claude-no-tty", runtime: `claude:t3:${original}`, threads });
+  const only = resolveRoute({ peerId: "kept", cwd: "/work/only", threads: [{ id: OTHER, worktreePath: "/work/only" }] });
+  expect("error" in byPath && byPath.error).toBe("no-route");
+  expect("error" in byRuntime && byRuntime.error).toBe("no-route");
+  expect("threadId" in only && only.threadId).toBe(OTHER);
+});
+
+test("a dead owner lease needs a wake, and a poll-only claude seat is not a push seat", () => {
+  expect(needsWake({ present: true, stale: false, runtime: "claude", ownerLive: false })).toBe(true);
+  expect(needsWake({ present: true, stale: false, runtime: "claude", ownerLive: true })).toBe(false);
+  expect(needsWake({ present: true, stale: false, runtime: "poll" })).toBe(true);
+});
+
+test("a refresh keeps a bound thread id, and a stale route is not fresh", () => {
+  expect(mergeRuntime("claude", `claude:t3:${FORK}`)).toBe(`claude:t3:${FORK}`);
+  expect(mergeRuntime(`codex:t3:${OTHER}`, `claude:t3:${FORK}`)).toBe(`codex:t3:${OTHER}`);
+  expect(routeIsFresh(new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString())).toBe(false);
+  expect(routeIsFresh(new Date().toISOString())).toBe(true);
+});
+
+test("a lost dispatch response is not retried, and a parent change is noticed", () => {
+  expect(retryDispatch("start_immediately", "running")).toBe("queue");
+  expect(retryDispatch("start_immediately", null)).toBe("abort");
+  expect(retryDispatch("start_immediately", "completed")).toBe("abort");
+  expect(retryDispatch("queue_after_active", "running")).toBe("abort");
+  expect(parentChanged(10, 11)).toBe(true);
+  expect(parentChanged(10, 10)).toBe(false);
+  expect(parentChanged(1, 50)).toBe(false);
+});
+
+test("a suffixed respawn can reclaim a reserved name only after the base seat is gone", () => {
+  const allowlist = loadAllowlist('{"assistant":"mac-assistant-claude-no-tty"}');
+  const live = [{ id: "mac-assistant-claude-no-tty", nickname: "Grok" }];
+  expect(nicknameDecision({
+    callerId: "mac-assistant-claude-no-tty-ab12",
+    nickname: "assistant",
+    live,
+    allowlist,
+  }).ok).toBe(false);
+  expect(nicknameDecision({
+    callerId: "mac-assistant-claude-no-tty-ab12",
+    nickname: "assistant",
+    live: [],
+    allowlist,
+  }).ok).toBe(true);
 });
 
 test("bell files reject a bad url, a bad route, and a nameless reservation", () => {

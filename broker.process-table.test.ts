@@ -187,7 +187,7 @@ test("send_message works when rings is null", async () => {
   expect(sent.json.ok).toBe(true);
 });
 
-test("duplicate nicknames still register", async () => {
+test("a second seat can register, but it does not keep a nickname already held", async () => {
   const a = await post("/register", {
     requested_id: "test-nick-a",
     nickname: "m3-bob-grok",
@@ -210,6 +210,10 @@ test("duplicate nicknames still register", async () => {
   });
   expect(a.json.id).toBe("test-nick-a");
   expect(b.json.id).toBe("test-nick-b");
+  const list = await post("/list-peers", { scope: "fleet", cwd: "/tmp/a", git_root: null });
+  const rows = list.json as { id: string; nickname: string }[];
+  expect(rows.find((row) => row.id === "test-nick-a")?.nickname).toBe("m3-bob-grok");
+  expect(rows.find((row) => row.id === "test-nick-b")?.nickname).toBe("");
 });
 
 test("set-state blocked_on", async () => {

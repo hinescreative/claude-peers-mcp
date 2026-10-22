@@ -9,8 +9,7 @@
   <key>WorkingDirectory</key><string>/Users/wesleyhines/mcp-servers/claude-peers-mcp</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/wesleyhines/.bun/bin/bun</string>
-    <string>/Users/wesleyhines/mcp-servers/claude-peers-mcp/bell.ts</string>
+    <string>/Users/wesleyhines/mcp-servers/claude-peers-mcp/scripts/bell-launch.sh</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

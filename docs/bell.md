@@ -22,10 +22,13 @@ Otherwise the sender gets `no-route`. How that was chosen: `docs/bell-route-disc
 
 - `launchd/com.hines.peers-bell.plist` on the Mac
 - `systemd/claude-peers-bell.service` on a Linux host
-- Broker env `CLAUDE_PEERS_BELLS` is a JSON object of machine to bell origin. `CLAUDE_PEERS_LOCAL_MACHINES` lists machine names whose pids this broker may check. The Mac bell also reaps dead pids on its own machine through `/reap-dead`.
+- Broker env `CLAUDE_PEERS_BELLS` is a **file path**. The file is JSON, machine name to bell origin, for example `{"mac":"http://100.103.170.84:8812"}`. It is not the JSON itself. `CLAUDE_PEERS_LOCAL_MACHINES` lists machine names whose pids this broker may check. The Mac bell also reaps dead pids on its own machine through `/reap-dead`.
+- The bearer is not in the plist. `scripts/bell-launch.sh` reads it from 1Password (`opa env claude-docs-integrations-keys.env`) and then execs `bell.ts`. The systemd unit should point `ExecStart` at that script, with `BELL_HOST` and `CLAUDE_PEERS_MACHINE` in the environment file.
 
-The T3 credential is `BELL_T3` (default `~/.local/state/peers-bell/t3.json`): `baseUrl`, `token`, `environmentId`. Mode 600. Not in git.
+The T3 credential is `BELL_T3` (default `~/.local/state/peers-bell/t3.json`): `baseUrl`, `token`, `environmentId`. Mode 600, owned by the user running the bell. The bell refuses anything looser. Not in git.
+
+A route is kept for 7 days (`CLAUDE_PEERS_ROUTE_TTL_MS`). A thread id in a route or a runtime is used only while that thread is still in the shell snapshot and not archived. A cwd match is refused when an archived thread already used that path, so a leftover fork is not woken by mistake.
 
 ## Rollback
 
-`launchctl bootout gui/$UID/com.hines.peers-bell`, or `systemctl --user disable --now claude-peers-bell.service`. Unset `CLAUDE_PEERS_BELLS` on the broker and restart it. Previous files stay beside the new ones.
+On the Mac: `launchctl bootout gui/$UID/com.hines.peers-bell`. On Linux: `systemctl --user disable --now claude-peers-bell.service`. Then remove `CLAUDE_PEERS_BELLS` from the broker's environment and restart the broker once (`systemctl --user restart claude-peers-broker.service` on theoldone). Previous files stay beside the new ones. Unsetting the variable without a broker restart leaves the running broker with the old path.

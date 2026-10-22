@@ -1,5 +1,6 @@
 // Starts an idle T3 thread, or queues behind a turn that is already running.
 // Same dispatch lead-wake uses. Never steers and never restarts a live run.
+import { retryDispatch } from "./bell-protocol.ts";
 
 export interface T3Auth {
   baseUrl: string;
@@ -92,8 +93,13 @@ export async function readShell(auth: T3Auth): Promise<ShellThread[]> {
   }));
 }
 
-async function dispatch(rpc: Awaited<ReturnType<typeof connect>>, threadId: string, text: string, dispatchMode: { type: string }) {
-  const commandId = crypto.randomUUID();
+async function dispatch(
+  rpc: Awaited<ReturnType<typeof connect>>,
+  threadId: string,
+  text: string,
+  dispatchMode: { type: string },
+  commandId: string,
+) {
   const result = await rpc.call("orchestration.dispatchCommand", {
     type: "message.dispatch",
     commandId,
@@ -108,6 +114,13 @@ async function dispatch(rpc: Awaited<ReturnType<typeof connect>>, threadId: stri
   return { commandId, sequence: result?.sequence ?? null, dispatchMode: dispatchMode.type };
 }
 
+async function readTurnState(auth: T3Auth, threadId: string): Promise<string | null> {
+  const snapshot = await http(auth, `/api/orchestration/threads/${encodeURIComponent(threadId)}`);
+  const thread = snapshot?.thread ?? snapshot?.projection ?? snapshot;
+  const state = thread?.latestTurn?.state;
+  return typeof state === "string" ? state : null;
+}
+
 export async function dispatchToThread(
   auth: T3Auth,
   threadId: string,
@@ -116,12 +129,15 @@ export async function dispatchToThread(
 ) {
   if (!auth?.baseUrl || !auth?.token) throw new Error("T3 credential is missing");
   const rpc = await connect(auth);
+  const commandId = crypto.randomUUID();
   try {
     try {
-      return await dispatch(rpc, threadId, text, dispatchMode);
+      return await dispatch(rpc, threadId, text, dispatchMode, commandId);
     } catch (error) {
-      if (dispatchMode.type !== "start_immediately") throw error;
-      return await dispatch(rpc, threadId, text, { type: "queue_after_active" });
+      let turn: string | null = null;
+      try { turn = await readTurnState(auth, threadId); } catch { throw error; }
+      if (retryDispatch(dispatchMode.type, turn) !== "queue") throw error;
+      return await dispatch(rpc, threadId, text, { type: "queue_after_active" }, commandId);
     }
   } finally {
     rpc.close();
