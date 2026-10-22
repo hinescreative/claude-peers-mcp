@@ -1,0 +1,15 @@
+[Unit]
+Description=claude-peers bell (tailnet :8812)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/mcp-servers/claude-peers-mcp
+EnvironmentFile=%h/.local/state/peers-bell/bell.env
+ExecStart=%h/.bun/bin/bun %h/mcp-servers/claude-peers-mcp/bell.ts
+Restart=always
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target

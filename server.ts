@@ -487,6 +487,21 @@ const TOOLS = [
     },
   },
   {
+    name: "set_route",
+    description:
+      "Tell the peers bell which T3 thread this seat is, once. Pass the thread id. After that a peers message can wake this thread when its process is gone.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        thread_id: {
+          type: "string" as const,
+          description: "T3 thread id, with or without the mcp: prefix.",
+        },
+      },
+      required: ["thread_id"],
+    },
+  },
+  {
     name: "set_context",
     description:
       "Set context window metadata for this peer. Use context_window for max tokens, context_used when known, and context_note for model/context notes. Unknown values should be omitted.",
@@ -668,6 +683,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ],
           isError: true,
         };
+      }
+    }
+
+    case "set_route": {
+      const threadId = String((args as { thread_id?: string }).thread_id ?? "").trim();
+      if (!/^(?:mcp:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) {
+        return { content: [{ type: "text" as const, text: "thread_id must be a T3 thread id" }], isError: true };
+      }
+      if (!myId || !canMutateBroker()) {
+        return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      }
+      try {
+        await brokerFetch("/set-runtime", { id: myId, runtime: `claude:t3:${threadId}`, ...leaseCredentials() });
+        return { content: [{ type: "text" as const, text: "Route registered. A peers message can wake this thread." }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error setting route: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
       }
     }
 
@@ -1187,7 +1218,15 @@ function registrationPayload(summary: string) {
     tty: myTty,
     machine: MACHINE_NAME,
     summary,
+    runtime: registeredRuntime(),
   };
+}
+
+function registeredRuntime(): string {
+  const thread = (process.env.CLAUDE_PEERS_THREAD_ID ?? process.env.T3_THREAD_ID ?? "").trim();
+  return /^(?:mcp:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(thread)
+    ? `claude:t3:${thread}`
+    : "claude";
 }
 
 function applyRegistration(registration: RegisterResponse): void {

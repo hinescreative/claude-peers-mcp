@@ -15,7 +15,17 @@
 import { Database } from "bun:sqlite";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { messageContractVersion } from "./shared/message-contract.ts";
+import {
+  bellPeerId,
+  loadAllowlist,
+  loadBells,
+  needsWake,
+  nicknameDecision,
+  normalizeRuntime,
+  pidAlive,
+} from "./bell-protocol.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -275,10 +285,46 @@ db.run(`
   ON messages (to_id, delivered, claim_expires_at, sent_at, id)
 `);
 
+// Survives unregister and reap. A released seat's row is gone; the next send
+// still knows which machine and cwd to wake.
+db.run(`
+  CREATE TABLE IF NOT EXISTS peer_routes (
+    id TEXT PRIMARY KEY,
+    machine TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    runtime TEXT,
+    pid INTEGER,
+    updated_at TEXT NOT NULL
+  )
+`);
+
+const LOCAL_MACHINES = new Set(
+  [require("os").hostname(), ...(process.env.CLAUDE_PEERS_LOCAL_MACHINES ?? "").split(",")]
+    .map((name) => name.trim())
+    .filter(Boolean),
+);
+
 function deletePeerAndUndeliveredMessages(id: string): void {
+  // The row goes. Undelivered mail stays so a wake can still hand it over.
+  const row = db.query("SELECT id, machine, cwd, runtime, pid FROM peers WHERE id = ?").get(id) as
+    | { id: string; machine: string; cwd: string; runtime: string | null; pid: number }
+    | null;
+  if (row?.cwd) {
+    db.run(
+      `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         machine = excluded.machine, cwd = excluded.cwd, runtime = excluded.runtime,
+         pid = excluded.pid, updated_at = excluded.updated_at`,
+      [row.id, row.machine, row.cwd, row.runtime, row.pid, new Date().toISOString()],
+    );
+  }
   db.run("DELETE FROM peer_leases WHERE peer_id = ?", [id]);
   db.run("DELETE FROM peers WHERE id = ?", [id]);
-  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+}
+
+function machineIsLocal(machine: string): boolean {
+  return LOCAL_MACHINES.has(machine);
 }
 
 function peerIsStale(peer: Pick<Peer, "last_seen">): boolean {
@@ -293,7 +339,6 @@ function touchPeer(id: string): void {
 // Clean up stale peers on startup and before broker operations. Local host peers
 // get a PID check; all peers are also bounded by last_seen TTL.
 function cleanStalePeers() {
-  const hostname = require("os").hostname();
   const peers = db.query("SELECT id, pid, machine, last_seen FROM peers").all() as {
     id: string;
     pid: number;
@@ -307,13 +352,8 @@ function cleanStalePeers() {
       continue;
     }
 
-    if (peer.machine === hostname) {
-      // Local peer — check if PID is alive
-      try {
-        process.kill(peer.pid, 0);
-      } catch {
-        deletePeerAndUndeliveredMessages(peer.id);
-      }
+    if (machineIsLocal(peer.machine) && !pidAlive(peer.pid)) {
+      deletePeerAndUndeliveredMessages(peer.id);
     }
   }
 }
@@ -590,11 +630,6 @@ function normalizeParentId(id: unknown): string | null {
   return trimmed || null;
 }
 
-function normalizeRuntime(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim().slice(0, 32);
-  return /^[a-zA-Z0-9_-]+$/.test(trimmed) ? trimmed : null;
-}
 
 function normalizeRings(value: unknown): string | null {
   let arr: unknown[] | null = null;
@@ -609,7 +644,7 @@ function normalizeRings(value: unknown): string | null {
     }
   }
   if (!arr) return null;
-  const nums = arr.filter((v): v is number => Number.isInteger(v) && v >= 0 && v <= 3);
+  const nums = arr.filter((v): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 3);
   return nums.length ? JSON.stringify(nums) : null;
 }
 
@@ -622,13 +657,13 @@ function normalizeBlockedOn(value: unknown): string | null {
 
 function decodeRings(raw: unknown): number[] | null {
   if (Array.isArray(raw)) {
-    return raw.filter((v): v is number => Number.isInteger(v) && v >= 0 && v <= 3);
+    return raw.filter((v): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 3);
   }
   if (typeof raw !== "string" || !raw) return null;
   try {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed)
-      ? parsed.filter((v: unknown): v is number => Number.isInteger(v) && v >= 0 && v <= 3)
+      ? parsed.filter((v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 3)
       : null;
   } catch {
     return null;
@@ -732,6 +767,16 @@ function replacePeerRegistration(
     blockedOn,
     blockedSince
   );
+  if (body.cwd) {
+    db.run(
+      `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         machine = excluded.machine, cwd = excluded.cwd, runtime = excluded.runtime,
+         pid = excluded.pid, updated_at = excluded.updated_at`,
+      [id, machine, body.cwd, runtime, body.pid, now],
+    );
+  }
 }
 
 // --- Per-instance peer ids ---
@@ -948,13 +993,61 @@ function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
+function nicknameAllowlist(): Record<string, string> {
+  const path = process.env.CLAUDE_PEERS_NICKNAMES
+    ?? fileURLToPath(new URL("./nicknames.json", import.meta.url));
+  try {
+    return loadAllowlist(readFileSync(path, "utf8"));
+  } catch {
+    console.error("[claude-peers broker] nickname allowlist unavailable");
+    return {};
+  }
+}
+
 function handleSetNickname(body: SetNicknameRequest): { ok: boolean; error?: string } {
   requireLeaseOwner(body.id, body);
-  const result = updateNickname.run(normalizeNickname(body.nickname), body.id);
+  const nickname = normalizeNickname(body.nickname);
+  const rows = db.query("SELECT id, nickname, last_seen FROM peers").all() as {
+    id: string;
+    nickname: string;
+    last_seen: string;
+  }[];
+  const decision = nicknameDecision({
+    callerId: body.id,
+    nickname,
+    live: rows.filter((row) => !peerIsStale(row)),
+    allowlist: nicknameAllowlist(),
+  });
+  if (!decision.ok) {
+    throw new HttpError(409, decision.error);
+  }
+  for (const id of decision.clearIds) updateNickname.run("", id);
+  const result = updateNickname.run(nickname, body.id);
   if (result.changes === 0) {
     return { ok: false, error: "peer not found or stale" };
   }
   return { ok: true };
+}
+
+function handleSetRuntime(body: { id?: string; runtime?: unknown } & LeaseCredentials): { ok: boolean; found: boolean; runtime?: string } {
+  if (!body?.id) throw new HttpError(400, "set-runtime requires a peer id");
+  requireLeaseOwner(body.id, body);
+  const runtime = normalizeRuntime(body.runtime);
+  if (!runtime) throw new HttpError(400, "invalid runtime");
+  const result = db.run("UPDATE peers SET runtime = ? WHERE id = ?", [runtime, body.id]);
+  if (result.changes === 0) return { ok: false, found: false };
+  const row = db.query("SELECT id, machine, cwd, pid FROM peers WHERE id = ?").get(body.id) as
+    | { id: string; machine: string; cwd: string; pid: number }
+    | null;
+  if (row?.cwd) {
+    db.run(
+      `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET runtime = excluded.runtime, updated_at = excluded.updated_at`,
+      [row.id, row.machine, row.cwd, runtime, row.pid, new Date().toISOString()],
+    );
+  }
+  return { ok: true, found: true, runtime };
 }
 
 function handleSetContext(body: SetContextRequest): void {
@@ -1003,24 +1096,16 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // For local peers, verify process is still alive
-  const hostname = require("os").hostname();
   peers = peers.filter((p) => {
     if (peerIsStale(p)) {
       deletePeerAndUndeliveredMessages(p.id);
       return false;
     }
 
-    if (p.machine === hostname) {
-      try {
-        process.kill(p.pid, 0);
-        return true;
-      } catch {
-        deletePeerAndUndeliveredMessages(p.id);
-        return false;
-      }
+    if (machineIsLocal(p.machine) && !pidAlive(p.pid)) {
+      deletePeerAndUndeliveredMessages(p.id);
+      return false;
     }
-    // Remote peers — trust heartbeat-based cleanup
     return true;
   });
 
@@ -1067,24 +1152,104 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
   requireLeaseOwner(body.from_id, body);
   touchPeer(body.from_id);
 
-  // Verify target exists
-  const target = db.query("SELECT id, last_seen FROM peers WHERE id = ?").get(body.to_id) as
-    | Pick<Peer, "id" | "last_seen">
+  const target = db.query("SELECT id, last_seen, machine, cwd, runtime, pid FROM peers WHERE id = ?").get(body.to_id) as
+    | { id: string; last_seen: string; machine: string; cwd: string; runtime: string | null; pid: number }
     | null;
-  if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
+  const remembered = target
+    ? null
+    : db.query("SELECT id, machine, cwd, runtime, pid FROM peer_routes WHERE id = ?").get(body.to_id) as
+      | { id: string; machine: string; cwd: string; runtime: string | null; pid: number }
+      | null;
+  if (!target && !remembered) {
+    return { ok: false, error: "no-route" };
   }
-  if (peerIsStale(target)) {
-    deletePeerAndUndeliveredMessages(target.id);
-    return { ok: false, error: `Peer ${body.to_id} is stale` };
-  }
+  const facts = target ?? remembered!;
+  const wake = needsWake({
+    present: Boolean(target),
+    stale: target ? peerIsStale(target) : true,
+    runtime: facts.runtime,
+  });
+  if (target && peerIsStale(target)) deletePeerAndUndeliveredMessages(target.id);
 
   const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId);
-  return { ok: true, message_id: Number(inserted.lastInsertRowid), duplicate: false };
+  const message_id = Number(inserted.lastInsertRowid);
+  if (!wake) return { ok: true, message_id, duplicate: false, wake: "skipped" };
+  return {
+    ok: true,
+    message_id,
+    duplicate: false,
+    wake: "needed",
+    bell: { to_id: body.to_id, machine: facts.machine, cwd: facts.cwd, runtime: facts.runtime, pid: facts.pid },
+  };
 });
 
-function handleSendMessage(body: SendMessageRequest) {
-  return sendMessage(body);
+async function forwardWake(target: { to_id: string; machine: string; cwd: string; runtime: string | null; pid: number | null }) {
+  const path = process.env.CLAUDE_PEERS_BELLS ?? "";
+  if (!path) return { ok: false, error: "bell-unconfigured" };
+  let origin: string | undefined;
+  try {
+    origin = loadBells(readFileSync(path, "utf8"))[target.machine];
+  } catch {
+    return { ok: false, error: "bell-unconfigured" };
+  }
+  if (!origin) return { ok: false, error: "bell-unconfigured" };
+  const token = ENV_TOKENS[0] ?? "";
+  try {
+    const res = await fetch(`${origin}/wake`, {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        to_id: target.to_id,
+        machine: target.machine,
+        cwd: target.cwd,
+        runtime: target.runtime,
+        pid: target.pid,
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    const json = await res.json().catch(() => null) as { ok?: boolean; error?: string; threadId?: string; dispatchMode?: string; tmux?: string } | null;
+    if (json?.error === "no-route") return { ok: false, error: "no-route" };
+    if (!res.ok || !json?.ok) return { ok: false, error: "bell-unreachable" };
+    return { ok: true, threadId: json.threadId ?? null, dispatchMode: json.dispatchMode ?? null, tmux: json.tmux ?? null };
+  } catch {
+    return { ok: false, error: "bell-unreachable" };
+  }
+}
+
+async function handleSendMessage(body: SendMessageRequest) {
+  const stored = sendMessage(body) as {
+    ok: boolean;
+    error?: string;
+    message_id?: number;
+    duplicate?: boolean;
+    wake?: string;
+    bell?: { to_id: string; machine: string; cwd: string; runtime: string | null; pid: number | null };
+  };
+  if (!stored.ok || stored.wake !== "needed" || !stored.bell) return stored;
+  const woke = await forwardWake(stored.bell);
+  if (!woke.ok) return { ok: false, error: woke.error, message_id: stored.message_id };
+  const { bell: _bell, ...rest } = stored;
+  return { ...rest, wake: "sent", threadId: woke.threadId ?? null, dispatchMode: woke.dispatchMode ?? null };
+}
+
+function handleReapDead(body: { id?: string; peer_id?: string; pid?: number; machine?: string } & LeaseCredentials): { ok: boolean; reaped: boolean; pending: number } {
+  if (!body?.id || !body.peer_id || !body.machine) throw new HttpError(400, "reap requires the bell id, peer id, and machine");
+  requireLeaseOwner(body.id, body);
+  const peer = db.query("SELECT id, pid, machine, cwd, runtime FROM peers WHERE id = ?").get(body.peer_id) as
+    | { id: string; pid: number; machine: string; cwd: string; runtime: string | null }
+    | null;
+  if (!peer) return { ok: true, reaped: false, pending: 0 };
+  if (peer.machine !== body.machine || Number(peer.pid) !== Number(body.pid)) {
+    throw new HttpError(409, "reap target does not match");
+  }
+  if (body.id !== bellPeerId(peer.machine)) throw new HttpError(403, "only that machine's bell can reap");
+  const pending = (db.query("SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0").get(peer.id) as { n: number }).n;
+  deletePeerAndUndeliveredMessages(peer.id);
+  return { ok: true, reaped: true, pending };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -1210,7 +1375,20 @@ Bun.serve({
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
-          return Response.json(handleSendMessage(body as SendMessageRequest));
+          return Response.json(await handleSendMessage(body as SendMessageRequest));
+        case "/set-runtime":
+          return Response.json(handleSetRuntime(body as { id?: string; runtime?: unknown } & LeaseCredentials));
+        case "/reap-dead": {
+          const reapBody = body as { id?: string; peer_id?: string; pid?: number; machine?: string } & LeaseCredentials;
+          const reaped = handleReapDead(reapBody);
+          if (reaped.reaped && reaped.pending > 0 && typeof reapBody.peer_id === "string") {
+            const route = db.query("SELECT id, machine, cwd, runtime, pid FROM peer_routes WHERE id = ?").get(reapBody.peer_id) as
+              | { id: string; machine: string; cwd: string; runtime: string | null; pid: number }
+              | null;
+            if (route) await forwardWake({ to_id: route.id, machine: route.machine, cwd: route.cwd, runtime: route.runtime, pid: route.pid });
+          }
+          return Response.json(reaped);
+        }
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/claim-messages":
