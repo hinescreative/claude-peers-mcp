@@ -19,7 +19,7 @@
  *   GROK_PEER_ALLOWLIST      optional comma-separated to_id allowlist
  */
 
-import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 const BROKER = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://100.108.57.10:7899").replace(/\/$/, "");
 const FLEET_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
@@ -346,15 +346,18 @@ async function callTool(name: string, args: Record<string, unknown> | undefined)
     if (!sent?.ok) {
       return textResult(sent?.error ?? "send failed", true);
     }
+    const formatted = formatSendResult(to_id, sent);
     return textResult(
       JSON.stringify({
-        ok: true,
+        ok: !formatted.isError,
         from_id: PEER_ID,
         to_id,
         message_id: sent.message_id,
         duplicate: sent.duplicate,
-        note: `Queued if target is live. No durable mailbox. Poll check_messages for replies to ${PEER_ID}.`,
+        wake: sent.wake ?? "skipped",
+        note: formatted.text,
       }),
+      formatted.isError,
     );
   }
 

@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { dispatchTimedOut, runStatus } from "./bell-dispatch.ts";
+import { formatSendResult } from "./shared/message-contract.ts";
 import {
   WAKE_TEXT,
   bellPeerId,
@@ -14,6 +16,7 @@ import {
   resolveRoute,
   retryDispatch,
   routeIsFresh,
+  shouldReaskBase,
 } from "./bell-protocol.ts";
 
 const THREAD = "mcp:36a41ff7-8eef-49ab-a947-55027c14f468";
@@ -146,6 +149,40 @@ test("a lost dispatch response is not retried, and a parent change is noticed", 
   expect(parentChanged(10, 11)).toBe(true);
   expect(parentChanged(10, 10)).toBe(false);
   expect(parentChanged(1, 50)).toBe(false);
+  expect(shouldReaskBase("mac-assistant-claude-no-tty", "mac-assistant-claude-no-tty-ab12")).toBe(true);
+  expect(shouldReaskBase("mac-assistant-claude-no-tty", "mac-assistant-claude-no-tty")).toBe(false);
+});
+
+test("turn state is read from projection.runs, and a timeout is not a retry", () => {
+  expect(runStatus({ projection: { runs: [{ ordinal: 1, status: "completed" }, { ordinal: 2, status: "running" }] } })).toBe("running");
+  expect(runStatus({ activityRunStatus: "running" })).toBe("running");
+  expect(dispatchTimedOut(new Error("RPC orchestration.dispatchCommand timed out"))).toBe(true);
+  expect(dispatchTimedOut(new Error("HTTP 409"))).toBe(false);
+  const hidden = formatSendResult("mac-box", { ok: true, message_id: 4, wake: "no-route" });
+  expect(hidden.text).toContain("wake: no-route");
+  expect(hidden.isError).toBe(true);
+});
+
+test("a fork is not a cwd match, and a path that has held two threads is not either", () => {
+  const survivor = "mcp:22222222-2222-4222-8222-222222222222:fork";
+  const only = resolveRoute({
+    cwd: "/work/assistant",
+    threads: [{ id: survivor, worktreePath: "/work/assistant" }],
+  });
+  expect("error" in only && only.error).toBe("no-route");
+  const plain = "mcp:33333333-3333-4333-8333-333333333333";
+  const crowded = resolveRoute({
+    cwd: "/work/only",
+    threads: [{ id: plain, worktreePath: "/work/only" }],
+    seenOnPath: [plain, "mcp:44444444-4444-4444-8444-444444444444"],
+  });
+  expect("error" in crowded && crowded.error).toBe("no-route");
+  const fresh = resolveRoute({
+    cwd: "/work/only",
+    threads: [{ id: plain, worktreePath: "/work/only" }],
+    seenOnPath: [plain],
+  });
+  expect("threadId" in fresh && fresh.threadId).toBe(plain);
 });
 
 test("a suffixed respawn can reclaim a reserved name only after the base seat is gone", () => {

@@ -2,6 +2,23 @@
 // Same dispatch lead-wake uses. Never steers and never restarts a live run.
 import { retryDispatch } from "./bell-protocol.ts";
 
+export function runStatus(snapshot: any): string | null {
+  const thread = snapshot?.thread ?? snapshot?.projection ?? snapshot;
+  const runs = thread?.projection?.runs ?? thread?.runs ?? snapshot?.projection?.runs;
+  if (Array.isArray(runs) && runs.length) {
+    const latest = [...runs].sort((a, b) => (b?.ordinal ?? 0) - (a?.ordinal ?? 0))[0];
+    if (typeof latest?.status === "string") return latest.status;
+  }
+  if (typeof thread?.activityRunStatus === "string") return thread.activityRunStatus;
+  if (typeof thread?.latestTurn?.state === "string") return thread.latestTurn.state;
+  return null;
+}
+
+export function dispatchTimedOut(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /timed out|timeout/i.test(message);
+}
+
 export interface T3Auth {
   baseUrl: string;
   token: string;
@@ -89,7 +106,7 @@ export async function readShell(auth: T3Auth): Promise<ShellThread[]> {
     id: String(thread.id ?? ""),
     worktreePath: typeof thread.worktreePath === "string" ? thread.worktreePath : null,
     archivedAt: typeof thread.archivedAt === "string" ? thread.archivedAt : null,
-    latestTurnState: typeof thread.latestTurn?.state === "string" ? thread.latestTurn.state : null,
+    latestTurnState: runStatus(thread),
   }));
 }
 
@@ -116,9 +133,7 @@ async function dispatch(
 
 async function readTurnState(auth: T3Auth, threadId: string): Promise<string | null> {
   const snapshot = await http(auth, `/api/orchestration/threads/${encodeURIComponent(threadId)}`);
-  const thread = snapshot?.thread ?? snapshot?.projection ?? snapshot;
-  const state = thread?.latestTurn?.state;
-  return typeof state === "string" ? state : null;
+  return runStatus(snapshot);
 }
 
 export async function dispatchToThread(
@@ -126,14 +141,15 @@ export async function dispatchToThread(
   threadId: string,
   text: string,
   dispatchMode: { type: "start_immediately" } | { type: "queue_after_active" },
+  commandId = crypto.randomUUID(),
 ) {
   if (!auth?.baseUrl || !auth?.token) throw new Error("T3 credential is missing");
   const rpc = await connect(auth);
-  const commandId = crypto.randomUUID();
   try {
     try {
       return await dispatch(rpc, threadId, text, dispatchMode, commandId);
     } catch (error) {
+      if (dispatchTimedOut(error)) throw error;
       let turn: string | null = null;
       try { turn = await readTurnState(auth, threadId); } catch { throw error; }
       if (retryDispatch(dispatchMode.type, turn) !== "queue") throw error;

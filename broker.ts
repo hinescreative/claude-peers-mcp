@@ -265,7 +265,7 @@ try {
 
 // Additive migration keeps existing mail readable. Do not hide migration failures.
 const messageColumns = new Set((db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map(row => row.name));
-for (const [name, definition] of Object.entries({ kind: "TEXT NOT NULL DEFAULT 'request'", reply_to_id: "INTEGER", client_message_id: "TEXT", wake_state: "TEXT" })) {
+for (const [name, definition] of Object.entries({ kind: "TEXT NOT NULL DEFAULT 'request'", reply_to_id: "INTEGER", client_message_id: "TEXT", wake_state: "TEXT", wake_command_id: "TEXT" })) {
   if (!messageColumns.has(name)) db.run(`ALTER TABLE messages ADD COLUMN ${name} ${definition}`);
 }
 db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id ON messages(from_id, client_message_id) WHERE client_message_id IS NOT NULL");
@@ -301,6 +301,8 @@ db.run(`
   )
 `);
 try { db.run("ALTER TABLE peer_routes ADD COLUMN requested_id TEXT"); } catch { /* already there */ }
+try { db.run("ALTER TABLE peer_routes ADD COLUMN effective_id TEXT"); } catch { /* already there */ }
+try { db.run("ALTER TABLE peers ADD COLUMN requested_id TEXT"); } catch { /* already there */ }
 
 const parsedRouteTtl = Number(process.env.CLAUDE_PEERS_ROUTE_TTL_MS ?? String(7 * 24 * 60 * 60 * 1000));
 const ROUTE_TTL_MS = Number.isFinite(parsedRouteTtl) && parsedRouteTtl >= 0 ? parsedRouteTtl : 7 * 24 * 60 * 60 * 1000;
@@ -330,26 +332,32 @@ function rememberRoute(row: {
   requestedId?: string | null;
 }): void {
   if (!row.cwd) return;
+  const stable = row.requestedId || row.id;
+  const baseWriter = row.id === stable ? 1 : 0;
   db.run(
-    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
-       machine = excluded.machine, cwd = excluded.cwd, runtime = excluded.runtime,
-       pid = excluded.pid,
-       requested_id = COALESCE(excluded.requested_id, peer_routes.requested_id),
-       updated_at = excluded.updated_at`,
-    [row.id, row.machine, row.cwd, row.runtime, row.pid, row.requestedId ?? null, new Date().toISOString()],
+       machine = excluded.machine,
+       cwd = CASE WHEN ? = 1 THEN excluded.cwd ELSE peer_routes.cwd END,
+       runtime = CASE WHEN ? = 1 THEN excluded.runtime ELSE peer_routes.runtime END,
+       pid = CASE WHEN ? = 1 THEN excluded.pid ELSE peer_routes.pid END,
+       effective_id = CASE WHEN ? = 1 THEN excluded.effective_id ELSE peer_routes.effective_id END,
+       requested_id = COALESCE(peer_routes.requested_id, excluded.requested_id),
+       updated_at = CASE WHEN ? = 1 THEN excluded.updated_at ELSE peer_routes.updated_at END`,
+    [
+      stable, row.machine, row.cwd, row.runtime, row.pid, stable, row.id, new Date().toISOString(),
+      baseWriter, baseWriter, baseWriter, baseWriter, baseWriter,
+    ],
   );
 }
 
-function retargetMail(newId: string, requestedId: string, cwd: string, machine: string): void {
-  const rows = db.query(
-    "SELECT id FROM peer_routes WHERE requested_id = ? AND cwd = ? AND machine = ? AND id <> ?",
-  ).all(requestedId, cwd, machine, newId) as { id: string }[];
-  for (const row of rows) {
-    if (liveLeaseFor(row.id)) continue;
-    db.run("UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered = 0", [newId, row.id]);
-  }
+function touchRoute(peerId: string): void {
+  const peer = db.query("SELECT requested_id FROM peers WHERE id = ?").get(peerId) as { requested_id: string | null } | null;
+  const stable = peer?.requested_id || peerId;
+  // A suffix is a sibling. Only the base seat refreshes the route.
+  if (stable !== peerId) return;
+  db.run("UPDATE peer_routes SET updated_at = ? WHERE id = ?", [new Date().toISOString(), stable]);
 }
 
 function machineIsLocal(machine: string): boolean {
@@ -482,10 +490,10 @@ const selectPeersByMachine = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, kind, reply_to_id, client_message_id, wake_state)
-  VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, kind, reply_to_id, client_message_id, wake_state, wake_command_id)
+  VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
 `);
-const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id, wake_state FROM messages WHERE from_id = ? AND client_message_id = ?");
+const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id, wake_state, wake_command_id FROM messages WHERE from_id = ? AND client_message_id = ?");
 const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ?");
 
 const selectUndelivered = db.prepare(`
@@ -768,7 +776,9 @@ function replacePeerRegistration(
   const carriedContextUsed = contextUsed ?? prior?.context_used ?? null;
   const carriedContextNote = contextNote === "" ? (prior?.context_note ?? "") : contextNote;
   const parentId = normalizeParentId(body.parent_id) ?? prior?.parent_id ?? null;
-  const runtime = mergeRuntime(normalizeRuntime(body.runtime), prior?.runtime ?? null);
+  const requested = normalizeRequestedId(body.requested_id);
+  const saved = requested ? freshRoute(requested) : null;
+  const runtime = mergeRuntime(normalizeRuntime(body.runtime), saved?.runtime ?? prior?.runtime ?? null);
   const rings = normalizeRings(body.rings) ?? (typeof prior?.rings === "string" ? prior.rings : normalizeRings(prior?.rings));
   const blockedOn = prior?.blocked_on ?? null;
   const blockedSince = prior?.blocked_since ?? null;
@@ -810,17 +820,10 @@ function replacePeerRegistration(
     blockedOn,
     blockedSince
   );
+  const stable = requested ?? id;
+  db.run("UPDATE peers SET requested_id = ? WHERE id = ?", [stable, id]);
   if (body.cwd) {
-    rememberRoute({
-      id,
-      machine,
-      cwd: body.cwd,
-      runtime,
-      pid: body.pid,
-      requestedId: normalizeRequestedId(body.requested_id),
-    });
-    const requested = normalizeRequestedId(body.requested_id);
-    if (requested) retargetMail(id, requested, body.cwd, machine);
+    rememberRoute({ id, machine, cwd: body.cwd, runtime, pid: body.pid, requestedId: stable });
   }
 }
 
@@ -880,13 +883,10 @@ function liveLeaseFor(id: string): PeerLease | null {
 //      suffixed id, lengthening the hash if that exact id is somehow held by
 //      another instance, and give up rather than spin forever.
 function resolveRegistrationId(base: string, instanceId: string): string {
-  // A reserved seat that was pushed onto a suffix while its base was busy
-  // takes the base back as soon as that lease is gone. Otherwise the suffix
-  // sticks and the reserved nickname stays locked.
-  if (Object.values(nicknameAllowlist()).includes(base)) {
-    const held = liveLeaseFor(base);
-    if (!held || held.instance_id === instanceId) return base;
-  }
+  // The base is the mailbox. Take it whenever it is free, even if this
+  // process currently holds a suffix. A suffix inherits nothing.
+  const held = liveLeaseFor(base);
+  if (!held || held.instance_id === instanceId) return base;
   for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
     const candidate = suffixedPeerId(base, instanceId, length);
     const lease = liveLeaseFor(candidate);
@@ -1003,11 +1003,17 @@ function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; found: boolean 
   const used = body.context_used !== undefined ? normalizeOptionalInt(body.context_used) : undefined;
   if (window !== undefined || used !== undefined) {
     const result = updateHeartbeatContext.run(now, window ?? null, used ?? null, body.id);
-    if (result.changes > 0 && lease) extendLease(lease, nowDate);
+    if (result.changes > 0) {
+      if (lease) extendLease(lease, nowDate);
+      touchRoute(body.id);
+    }
     return { ok: true, found: result.changes > 0 };
   }
   const result = updateLastSeen.run(now, body.id);
-  if (result.changes > 0 && lease) extendLease(lease, nowDate);
+  if (result.changes > 0) {
+    if (lease) extendLease(lease, nowDate);
+    touchRoute(body.id);
+  }
   return { ok: true, found: result.changes > 0 };
 }
 
@@ -1181,14 +1187,14 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
   if (clientId !== null && (typeof clientId !== "string" || !clientId.trim() || clientId.length > 128)) throw new HttpError(400, "invalid client_message_id");
   requireLeaseOwner(body.from_id, body);
   if (clientId !== null) {
-    const existing = selectMessageByClientId.get(body.from_id, clientId) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null; wake_state: string | null } | null;
+    const existing = selectMessageByClientId.get(body.from_id, clientId) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null; wake_state: string | null; wake_command_id: string | null } | null;
     if (existing) {
       if (existing.to_id !== body.to_id || existing.text !== body.text || existing.kind !== kind || existing.reply_to_id !== replyTo) throw new HttpError(409, "client_message_id already used for a different message");
       const retryWake = existing.wake_state === "failed" || existing.wake_state === "unconfigured" || existing.wake_state === "no-route" || existing.wake_state === "pending";
       if (!retryWake) return { ok: true, message_id: existing.id, duplicate: true, wake: existing.wake_state ?? "skipped" };
       const again = bellFacts(body.to_id);
       if (!again) return { ok: true, message_id: existing.id, duplicate: true, wake: existing.wake_state };
-      return { ok: true, message_id: existing.id, duplicate: true, wake: "needed", bell: again };
+      return { ok: true, message_id: existing.id, duplicate: true, wake: "needed", command_id: existing.wake_command_id, bell: again };
     }
   }
   if (replyTo !== null) {
@@ -1218,7 +1224,8 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
   });
   if (target && peerIsStale(target)) deletePeerAndUndeliveredMessages(target.id);
 
-  const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId, wake ? "pending" : "skipped");
+  const commandId = wake ? crypto.randomUUID() : null;
+  const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId, wake ? "pending" : "skipped", commandId);
   const message_id = Number(inserted.lastInsertRowid);
   if (!wake) return { ok: true, message_id, duplicate: false, wake: "skipped" };
   return {
@@ -1226,11 +1233,14 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
     message_id,
     duplicate: false,
     wake: "needed",
+    command_id: commandId,
     bell: { to_id: body.to_id, machine: facts.machine, cwd: facts.cwd, runtime: facts.runtime, pid: facts.pid },
   };
 });
 
-async function forwardWake(target: { to_id: string; machine: string; cwd: string; runtime: string | null; pid: number | null }) {
+const wakesInFlight = new Set<number>();
+
+async function forwardWake(target: { to_id: string; machine: string; cwd: string; runtime: string | null; pid: number | null; command_id?: string | null }) {
   const path = process.env.CLAUDE_PEERS_BELLS ?? "";
   if (!path) return { ok: false, error: "bell-unconfigured" };
   let origin: string | undefined;
@@ -1255,6 +1265,7 @@ async function forwardWake(target: { to_id: string; machine: string; cwd: string
         cwd: target.cwd,
         runtime: target.runtime,
         pid: target.pid,
+        command_id: target.command_id ?? null,
       }),
       signal: AbortSignal.timeout(8_000),
     });
@@ -1274,10 +1285,20 @@ async function handleSendMessage(body: SendMessageRequest) {
     message_id?: number;
     duplicate?: boolean;
     wake?: string;
+    command_id?: string | null;
     bell?: { to_id: string; machine: string; cwd: string; runtime: string | null; pid: number | null };
   };
-  if (!stored.ok || stored.wake !== "needed" || !stored.bell) return stored;
-  const woke = await forwardWake(stored.bell);
+  if (!stored.ok || stored.wake !== "needed" || !stored.bell || !stored.message_id) return stored;
+  if (wakesInFlight.has(stored.message_id)) {
+    return { ok: true, message_id: stored.message_id, duplicate: true, wake: "pending" };
+  }
+  wakesInFlight.add(stored.message_id);
+  let woke: { ok: boolean; error?: string; threadId?: string | null; dispatchMode?: string | null };
+  try {
+    woke = await forwardWake({ ...stored.bell, command_id: stored.command_id });
+  } finally {
+    wakesInFlight.delete(stored.message_id);
+  }
   const wake = woke.ok ? "sent" : woke.error === "no-route" ? "no-route" : woke.error === "bell-unconfigured" ? "unconfigured" : "failed";
   if (stored.message_id) db.run("UPDATE messages SET wake_state = ? WHERE id = ?", [wake, stored.message_id]);
   const { bell: _bell, ...rest } = stored;
@@ -1395,6 +1416,7 @@ function handleAckMessages(body: AckMessagesRequest): AckMessagesResponse {
 
 function handleUnregister(body: UnregisterRequest): void {
   requireLeaseOwner(body.id, body);
+  touchRoute(body.id);
   deletePeerLease.run(body.id);
   deletePeer.run(body.id);
 }

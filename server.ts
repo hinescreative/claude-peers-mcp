@@ -42,8 +42,8 @@ import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
-import { THREAD_ID } from "./bell-protocol.ts";
+import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { THREAD_ID, shouldReaskBase } from "./bell-protocol.ts";
 
 // --- Configuration ---
 
@@ -796,9 +796,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}. Message ID: ${result.message_id ?? "unavailable"}.` }],
-        };
+        const formatted = formatSendResult(to_id, result);
+        return { content: [{ type: "text" as const, text: formatted.text }], isError: formatted.isError };
       } catch (e) {
         return {
           content: [
@@ -1336,6 +1335,8 @@ async function heartbeatLoop(): Promise<void> {
         myRole = "unregistered";
         myLeaseId = null;
         myLeaseExpiresAt = null;
+        await registerUntilActive(mySummary);
+      } else if (shouldReaskBase(myRequestedId, myId)) {
         await registerUntilActive(mySummary);
       }
     } catch (error) {

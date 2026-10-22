@@ -134,7 +134,8 @@ export async function start() {
     let auth: T3Auth;
     try { auth = loadT3Auth(t3Path); } catch { return { ok: false, error: "credential-unavailable" }; }
     try {
-      const sent = await dispatchToThread(auth, planned.threadId, planned.text, planned.dispatchMode);
+      const commandId = typeof body?.command_id === "string" && body.command_id ? body.command_id : undefined;
+      const sent = await dispatchToThread(auth, planned.threadId, planned.text, planned.dispatchMode, commandId);
       log(`woke ${toId} ${sent.dispatchMode}`);
       return { ok: true, to_id: toId, threadId: planned.threadId, dispatchMode: sent.dispatchMode };
     } catch {

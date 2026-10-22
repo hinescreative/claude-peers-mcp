@@ -130,6 +130,7 @@ export interface SendMessageResponse {
   message_id?: number;
   duplicate?: boolean;
   error?: string;
+  wake?: string;
 }
 
 export interface PollMessagesRequest {

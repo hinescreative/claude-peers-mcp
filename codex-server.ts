@@ -23,7 +23,7 @@ import type {
   RegisterResponse,
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
-import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 import { THREAD_ID, parentChanged } from "./bell-protocol.ts";
 
 type ClaudePeersEnv = {
@@ -493,9 +493,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
 
-      return {
-        content: [{ type: "text" as const, text: `Message sent to peer ${to_id}. Message ID: ${result.message_id ?? "unavailable"}.` }],
-      };
+      const formatted = formatSendResult(to_id, result);
+      return { content: [{ type: "text" as const, text: formatted.text }], isError: formatted.isError };
     }
 
     case "set_route": {

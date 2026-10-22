@@ -92,6 +92,16 @@ export function parentChanged(startPid: number, currentPid: number): boolean {
   return Number.isInteger(currentPid) && currentPid !== startPid;
 }
 
+// A suffix is a sibling waiting on the base. It asks again every heartbeat.
+export function shouldReaskBase(requestedId: string, effectiveId: string): boolean {
+  return Boolean(requestedId) && requestedId !== effectiveId;
+}
+
+// mcp:uuid:fork is a fork. A plain uuid or mcp:uuid is not.
+export function isForkThread(id: string): boolean {
+  return id.replace(/^mcp:/i, "").includes(":");
+}
+
 export function bellPeerId(machine: string): string {
   const safe = machine.replace(/[^a-zA-Z0-9_-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
   const id = `bell-${safe || "host"}`;
@@ -139,6 +149,7 @@ export function resolveRoute(input: {
   runtime?: string | null;
   overrides?: Record<string, RouteOverride>;
   threads?: ThreadFact[];
+  seenOnPath?: string[];
 }): ResolvedRoute {
   const threads = input.threads;
   const usable = (id: string): ResolvedRoute | { error: "no-route" } | null => {
@@ -164,12 +175,16 @@ export function resolveRoute(input: {
     if (decided) return decided;
   }
 
+  // The shell snapshot does not include archived threads, so a cwd match is
+  // only safe when one live thread has this path, it is not a fork, and this
+  // bell has never seen a second thread on the path.
+  if ((input.seenOnPath?.length ?? 0) > 1) return { error: "no-route" };
   const live = (threads ?? []).filter((thread) => !thread.archivedAt && thread.worktreePath);
   const archivedSame = (threads ?? []).some((thread) => thread.archivedAt && samePath(thread.worktreePath, input.cwd));
   if (archivedSame) return { error: "no-route" };
   const matches = live.filter((thread) => samePath(thread.worktreePath, input.cwd));
   const only = matches.length === 1 ? matches[0] : undefined;
-  if (only && THREAD_ID.test(only.id)) return { kind: "thread", threadId: only.id };
+  if (only && THREAD_ID.test(only.id) && !isForkThread(only.id)) return { kind: "thread", threadId: only.id };
   return { error: "no-route" };
 }
 
