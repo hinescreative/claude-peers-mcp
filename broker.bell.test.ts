@@ -22,7 +22,7 @@ let bellHold: Promise<void> | null = null;
 const bell = Bun.serve({
   port: BELL_PORT,
   fetch: async (req) => {
-    const body = await req.json();
+    const body = await req.json() as { command_id?: string };
     if (bellHold) await bellHold;
     wakes.push({ body, auth: req.headers.get("Authorization"), command_id: body.command_id });
     if (bellMode === "no-route") return Response.json({ ok: false, error: "no-route" });
@@ -31,6 +31,18 @@ const bell = Bun.serve({
 });
 
 let proc: ReturnType<typeof Bun.spawn> | null = null;
+
+async function waitWake(messageId: number) {
+  const { Database } = await import("bun:sqlite");
+  for (let i = 0; i < 40; i++) {
+    const db = new Database(DB, { readonly: true });
+    const row = db.query("SELECT wake_state FROM messages WHERE id = ?").get(messageId) as { wake_state: string | null } | null;
+    db.close();
+    if (row?.wake_state && row.wake_state !== "pending") return row.wake_state;
+    await Bun.sleep(25);
+  }
+  return "pending";
+}
 
 async function post(path: string, body: Record<string, unknown>) {
   const res = await fetch(BASE + path, {
@@ -102,8 +114,8 @@ test("a codex seat is woken with no message body, and the mail stays", async () 
   expect((await post("/register", seat("codex-only", { runtime: "codex", pid: 4242 }))).status).toBe(200);
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "codex-only", text: "SECRET-MAIL please ack" });
   expect(sent.json.ok).toBe(true);
-  expect(sent.json.wake).toBe("sent");
-  expect(sent.json.dispatchMode).toBe("queue_after_active");
+  expect(sent.json.wake).toBe("pending");
+  expect(await waitWake(sent.json.message_id)).toBe("sent");
   const wake = wakes.at(-1)!;
   expect(wake.auth).toBe("Bearer test-token");
   expect(wake.body.to_id).toBe("codex-only");
@@ -117,14 +129,16 @@ test("a seat that has unregistered is still woken from the remembered route", as
   await post("/unregister", { id: "codex-only" });
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "codex-only", text: "SECRET-MAIL again" });
   expect(sent.json.ok).toBe(true);
-  expect(sent.json.wake).toBe("sent");
+  expect(sent.json.wake).toBe("pending");
+  expect(await waitWake(sent.json.message_id)).toBe("sent");
   expect(wakes.at(-1)!.body.runtime).toBe("codex");
 });
 
 test("a dead local pid is reaped and the next send wakes that route", async () => {
   expect((await post("/register", seat("codex-dead", { runtime: "codex", pid: 2147483646 }))).status).toBe(200);
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "codex-dead", text: "SECRET-MAIL dead" });
-  expect(sent.json.wake).toBe("sent");
+  expect(sent.json.wake).toBe("pending");
+  expect(await waitWake(sent.json.message_id)).toBe("sent");
   expect(wakes.at(-1)!.body.to_id).toBe("codex-dead");
 });
 
@@ -140,7 +154,8 @@ test("the bell refusing a route is returned to the sender", async () => {
   expect((await post("/register", seat("codex-lost", { runtime: "codex" }))).status).toBe(200);
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "codex-lost", text: "SECRET-MAIL lost" });
   expect(sent.json.ok).toBe(true);
-  expect(sent.json.wake).toBe("no-route");
+  expect(sent.json.wake).toBe("pending");
+  expect(await waitWake(sent.json.message_id)).toBe("no-route");
   expect(sent.json.message_id).toBeGreaterThan(0);
   bellMode = "ok";
 });
@@ -260,14 +275,16 @@ test("a failed wake stays accepted, and the same client id retries the wake", as
     from_id: "mac-sender", to_id: "codex-only", text: "once", client_message_id: "retry-1",
   });
   expect(first.json.ok).toBe(true);
-  expect(first.json.wake).toBe("no-route");
+  expect(first.json.wake).toBe("pending");
+  expect(await waitWake(first.json.message_id)).toBe("no-route");
   const id = first.json.message_id;
   bellMode = "ok";
   const again = await post("/send-message", {
     from_id: "mac-sender", to_id: "codex-only", text: "once", client_message_id: "retry-1",
   });
   expect(again.json.ok).toBe(true);
-  expect(again.json.wake).toBe("sent");
+  expect(again.json.wake).toBe("pending");
+  expect(await waitWake(again.json.message_id)).toBe("sent");
   expect(again.json.message_id).toBe(id);
   expect(again.json.duplicate).toBe(true);
 });
@@ -288,7 +305,8 @@ test("an expired owner lease is woken even though the row and the pid are alive"
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "mac-lease-dead", text: "lease-mail" });
   try {
     expect(sent.json.ok).toBe(true);
-    expect(sent.json.wake).toBe("sent");
+    expect(sent.json.wake).toBe("pending");
+    expect(await waitWake(sent.json.message_id)).toBe("sent");
     expect(wakes.length).toBe(before + 1);
   } finally {
     sleeper.kill();
@@ -306,7 +324,8 @@ test("a heartbeat keeps a route alive across unregister", async () => {
   await post("/unregister", { id: "codex-only" });
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "codex-only", text: "still-routed" });
   expect(sent.json.ok).toBe(true);
-  expect(sent.json.wake).toBe("sent");
+  expect(sent.json.wake).toBe("pending");
+  expect(await waitWake(sent.json.message_id)).toBe("sent");
 });
 
 test("one stored message gets one wake even when the retry overlaps", async () => {
@@ -327,4 +346,74 @@ test("one stored message gets one wake even when the retry overlaps", async () =
   const done = await first;
   expect(done.json.ok).toBe(true);
   expect(wakes.length).toBe(marker + 1);
+});
+
+test("a reserved base stays with its session when a sibling registers first", async () => {
+  const { Database } = await import("bun:sqlite");
+  const cleanup = new Database(DB);
+  cleanup.run("DELETE FROM peer_leases WHERE peer_id = ? OR peer_id LIKE ?", ["mac-assistant-claude-no-tty", "mac-assistant-claude-no-tty-%"]);
+  cleanup.run("DELETE FROM peers WHERE id = ? OR requested_id = ?", ["mac-assistant-claude-no-tty", "mac-assistant-claude-no-tty"]);
+  cleanup.run("DELETE FROM peer_routes WHERE id = ?", ["mac-assistant-claude-no-tty"]);
+  cleanup.close();
+  const sleeps = [Bun.spawn(["sleep", "30"]), Bun.spawn(["sleep", "30"]), Bun.spawn(["sleep", "30"])];
+  const [realPid, otherPid, laterPid] = sleeps.map((child) => child.pid);
+  try {
+    const first = await post("/register", {
+      ...seat("mac-assistant-claude-no-tty", { pid: realPid, cwd: "/tmp/heir", runtime: "claude" }),
+      instance_id: "heir-real-session",
+      payload_version: 2,
+      session: "session-real",
+      nickname: "Grok",
+    });
+    expect(first.json.id).toBe("mac-assistant-claude-no-tty");
+    await post("/unregister", { id: first.json.id, instance_id: "heir-real-session", lease_id: first.json.lease_id });
+    const sibling = await post("/register", {
+      ...seat("mac-assistant-claude-no-tty", { pid: otherPid, cwd: "/tmp/heir", runtime: "claude" }),
+      instance_id: "heir-other-session",
+      payload_version: 2,
+      session: "session-other",
+      nickname: "Grok",
+    });
+    expect(String(sibling.json.id).startsWith("mac-assistant-claude-no-tty-")).toBe(true);
+    const list = await post("/list-peers", { scope: "fleet", cwd: "/tmp/heir", git_root: null });
+    const siblingRow = (list.json as { id: string; runtime: string | null }[]).find((peer) => peer.id === sibling.json.id);
+    expect(siblingRow?.runtime).toBe("claude");
+    const real = await post("/register", {
+      ...seat("mac-assistant-claude-no-tty", { pid: laterPid, cwd: "/tmp/heir", runtime: "claude" }),
+      instance_id: "heir-real-again",
+      payload_version: 2,
+      session: "session-real",
+    });
+    expect(real.json.id).toBe("mac-assistant-claude-no-tty");
+  } finally {
+    for (const child of sleeps) child.kill();
+  }
+});
+
+test("a route is not moved to another machine", async () => {
+  const owner = await post("/register", seat("mac-home", { runtime: "claude:t3:mcp:11111111-1111-4111-8111-111111111111", machine: "mac" }));
+  expect(owner.json.id).toBe("mac-home");
+  await post("/unregister", { id: "mac-home" });
+  const other = await post("/register", seat("mac-home", { runtime: "claude", machine: "pc", pid: process.pid }));
+  expect(other.json.id).toBe("mac-home");
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(DB, { readonly: true });
+  const route = db.query("SELECT machine, runtime FROM peer_routes WHERE id = ?").get("mac-home") as { machine: string; runtime: string };
+  db.close();
+  expect(route.machine).toBe("mac");
+  expect(route.runtime).toBe("claude:t3:mcp:11111111-1111-4111-8111-111111111111");
+});
+
+test("a slow bell still returns the stored send inside a second", async () => {
+  let release: () => void = () => {};
+  bellHold = new Promise<void>((resolve) => { release = resolve; });
+  const started = Date.now();
+  const sent = await post("/send-message", { from_id: "mac-sender", to_id: "codex-lost", text: "slow", client_message_id: "slow-1" });
+  expect(Date.now() - started).toBeLessThan(1500);
+  expect(sent.json.ok).toBe(true);
+  expect(sent.json.wake).toBe("pending");
+  expect(sent.json.message_id).toBeGreaterThan(0);
+  release();
+  bellHold = null;
+  expect(await waitWake(sent.json.message_id)).toBe("sent");
 });

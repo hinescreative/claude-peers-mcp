@@ -12,7 +12,9 @@ A running turn is `queue_after_active`. Anything else is `start_immediately`. A 
 2. `runtime` of `t3:<threadId>` or `<harness>:t3:<threadId>`
 3. one thread whose worktree path equals the peer's cwd
 
-A seat whose T3 project is the checkout root has `worktreePath: null`. Step 3 cannot see it. That seat needs step 1 or step 2. The Assistant fork is one of these.
+A cwd match is only for a path under `~/.t3/worktrees/` with exactly one live thread that is not a fork. T3 makes one worktree per thread, so that is unique. A project root, including the Assistant, resolves only by an explicit route.
+
+An unreserved id is first-come: whoever registers while the base is free holds it. A reserved id (the nickname file) is held by the Claude session that last had it. A different session gets a suffix even when the base is free. Moving that seat to a new session is `POST /set-heir` with `base_id` and `session`, or `set_route` for the thread binding. A suffix never reads or writes the base route, and a route is not moved to another machine.
 
 Nothing sets step 2 today. `server.ts` and `codex-server.ts` will register `claude:t3:<id>` or `codex:t3:<id>` if `CLAUDE_PEERS_THREAD_ID` or `T3_THREAD_ID` is in the environment. T3 does not put either there. The tool that sets it by hand is `set_route` with `thread_id`. No AGENTS.md line calls it, and a seat cannot see its own thread id from the environment, so a startup line would have nothing to pass. Until something records the id, a root-cwd seat is a `routes.json` entry.
 

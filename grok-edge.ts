@@ -35,17 +35,19 @@ const ALLOWLIST = (process.env.GROK_PEER_ALLOWLIST ?? "")
   .filter(Boolean);
 const SUMMARY_MAX = 96;
 
-if (!PUBLIC_TOKEN) {
-  console.error("[grok-edge] FATAL: GROK_MCP_TOKEN is required");
-  process.exit(1);
-}
-if (!FLEET_TOKEN) {
-  console.error("[grok-edge] FATAL: CLAUDE_PEERS_TOKEN is required");
-  process.exit(1);
-}
-if (!/^[a-zA-Z0-9_-]{3,64}$/.test(PEER_ID)) {
-  console.error("[grok-edge] FATAL: GROK_PEER_ID must match [a-zA-Z0-9_-]{3,64}");
-  process.exit(1);
+function assertEdgeConfig(): void {
+  if (!PUBLIC_TOKEN) {
+    console.error("[grok-edge] FATAL: GROK_MCP_TOKEN is required");
+    process.exit(1);
+  }
+  if (!FLEET_TOKEN) {
+    console.error("[grok-edge] FATAL: CLAUDE_PEERS_TOKEN is required");
+    process.exit(1);
+  }
+  if (!/^[a-zA-Z0-9_-]{3,64}$/.test(PEER_ID)) {
+    console.error("[grok-edge] FATAL: GROK_PEER_ID must match [a-zA-Z0-9_-]{3,64}");
+    process.exit(1);
+  }
 }
 
 async function broker(path: string, body: unknown): Promise<any> {
@@ -229,6 +231,43 @@ function textResult(text: string, isError = false) {
   };
 }
 
+const LEAD_WAKE_URL = process.env.LEAD_WAKE_URL ?? "http://100.108.57.10:8811/wake";
+
+export function shouldWakeLead(result: { ok?: boolean; error?: string; wake?: string } | null | undefined): boolean {
+  if (!result) return false;
+  if (result.wake === "no-route" || result.wake === "unconfigured") return true;
+  if (result.ok) return false;
+  const text = String(result.error ?? "");
+  return text === "peer not found or stale"
+    || /^Peer \S+ not found$/.test(text)
+    || /^Peer \S+ is stale$/.test(text);
+}
+
+async function wakeLead(to_id: string, message: string, args: Record<string, unknown>) {
+  const token = process.env.CLAUDE_PEERS_TOKEN;
+  if (!token) return { ok: false, error: "lead-wake token missing" };
+  try {
+    const res = await fetch(LEAD_WAKE_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        to_id,
+        message,
+        from_id: PEER_ID,
+        kind: typeof args.kind === "string" ? args.kind : undefined,
+        client_message_id: typeof args.client_message_id === "string" ? args.client_message_id : undefined,
+      }),
+      signal: AbortSignal.timeout(20_000),
+      redirect: "error",
+    });
+    const body = await res.json().catch(() => ({})) as { ok?: boolean; error?: string; threadId?: string; dispatchMode?: string };
+    if (!res.ok || !body?.ok) return { ok: false, error: body?.error ?? `HTTP ${res.status}` };
+    return body;
+  } catch {
+    return { ok: false, error: "lead-wake unreachable" };
+  }
+}
+
 async function callTool(name: string, args: Record<string, unknown> | undefined) {
   const a = args ?? {};
   if (name === "list_peers") {
@@ -343,6 +382,17 @@ async function callTool(name: string, args: Record<string, unknown> | undefined)
       to_id,
       text: message,
     }, a);
+    if (shouldWakeLead(sent)) {
+      const woke = await wakeLead(to_id, message, a);
+      if (woke?.ok) {
+        return textResult(JSON.stringify({
+          ok: true, woke: true, from_id: PEER_ID, to_id,
+          threadId: woke.threadId, dispatchMode: woke.dispatchMode,
+          note: "Peer was offline. lead-wake started the Mac T3 thread with this message.",
+        }));
+      }
+      return textResult(`${sent?.error ?? sent?.wake ?? "send failed"}; lead-wake: ${woke?.error ?? "failed"}`, true);
+    }
     if (!sent?.ok) {
       return textResult(sent?.error ?? "send failed", true);
     }
@@ -422,6 +472,8 @@ async function handleRpc(msg: any) {
   return rpcError(id, -32601, `method not found: ${method}`);
 }
 
+if (import.meta.main) {
+assertEdgeConfig();
 await registerSeat();
 await heartbeat();
 setInterval(() => {
@@ -475,3 +527,4 @@ Bun.serve({
 });
 
 console.error(`[grok-edge] ${HOST}:${PORT} → ${BROKER} as ${PEER_ID} (${PEER_NICK})`);
+}

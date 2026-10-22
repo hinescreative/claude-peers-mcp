@@ -12,8 +12,10 @@ import {
   nicknameDecision,
   normalizeRuntime,
   parentChanged,
+  parentSession,
   planDispatch,
   resolveRoute,
+  runStarted,
   retryDispatch,
   routeIsFresh,
   shouldReaskBase,
@@ -48,10 +50,11 @@ test("routes prefer an override, then a registered thread, then one worktree", (
   ];
   const ambiguous = resolveRoute({ peerId: "codex-shaw", cwd: "/work/shaw", threads });
   expect("error" in ambiguous && ambiguous.error).toBe("no-route");
+  const onlyPath = "/Users/wesleyhines/.t3/worktrees/proof/only";
   expect(resolveRoute({
     peerId: "codex-only",
-    cwd: "/work/only/",
-    threads,
+    cwd: onlyPath + "/",
+    threads: threads.map((thread) => thread.worktreePath === "/work/only" ? { ...thread, worktreePath: onlyPath } : thread),
   })).toEqual({ kind: "thread", threadId: "mcp:11111111-1111-4111-8111-111111111111" });
   expect(resolveRoute({
     peerId: "codex-shaw",
@@ -122,7 +125,8 @@ test("an archived thread is not a route, and its cwd does not fall through to a 
   ];
   const byPath = resolveRoute({ peerId: "mac-assistant-claude-no-tty", cwd: "/work/assistant", threads });
   const byRuntime = resolveRoute({ peerId: "mac-assistant-claude-no-tty", runtime: `claude:t3:${original}`, threads });
-  const only = resolveRoute({ peerId: "kept", cwd: "/work/only", threads: [{ id: OTHER, worktreePath: "/work/only" }] });
+  const keptPath = "/Users/wesleyhines/.t3/worktrees/kept/only";
+  const only = resolveRoute({ peerId: "kept", cwd: keptPath, threads: [{ id: OTHER, worktreePath: keptPath }] });
   expect("error" in byPath && byPath.error).toBe("no-route");
   expect("error" in byRuntime && byRuntime.error).toBe("no-route");
   expect("threadId" in only && only.threadId).toBe(OTHER);
@@ -163,26 +167,27 @@ test("turn state is read from projection.runs, and a timeout is not a retry", ()
   expect(hidden.isError).toBe(true);
 });
 
-test("a fork is not a cwd match, and a path that has held two threads is not either", () => {
-  const survivor = "mcp:22222222-2222-4222-8222-222222222222:fork";
-  const only = resolveRoute({
-    cwd: "/work/assistant",
-    threads: [{ id: survivor, worktreePath: "/work/assistant" }],
-  });
-  expect("error" in only && only.error).toBe("no-route");
+test("only a single live worktree thread matches by path; a project root does not", () => {
   const plain = "mcp:33333333-3333-4333-8333-333333333333";
-  const crowded = resolveRoute({
-    cwd: "/work/only",
-    threads: [{ id: plain, worktreePath: "/work/only" }],
-    seenOnPath: [plain, "mcp:44444444-4444-4444-8444-444444444444"],
+  const root = resolveRoute({
+    cwd: "/Users/wesleyhines/hines/assistant-claude",
+    threads: [{ id: plain, worktreePath: "/Users/wesleyhines/hines/assistant-claude" }],
   });
-  expect("error" in crowded && crowded.error).toBe("no-route");
-  const fresh = resolveRoute({
-    cwd: "/work/only",
-    threads: [{ id: plain, worktreePath: "/work/only" }],
-    seenOnPath: [plain],
+  expect("error" in root && root.error).toBe("no-route");
+  const worktree = "/Users/wesleyhines/.t3/worktrees/bell-proof/codex";
+  const fork = resolveRoute({
+    cwd: worktree,
+    threads: [{ id: "mcp:22222222-2222-4222-8222-222222222222:fork", worktreePath: worktree }],
   });
-  expect("threadId" in fresh && fresh.threadId).toBe(plain);
+  expect("error" in fork && fork.error).toBe("no-route");
+  const one = resolveRoute({
+    cwd: worktree,
+    threads: [{ id: plain, worktreePath: worktree }],
+  });
+  expect("threadId" in one && one.threadId).toBe(plain);
+  expect(parentSession("claude --resume e58d40fb-1111-4111-8111-111111111111 --model x")).toBe("e58d40fb-1111-4111-8111-111111111111");
+  expect(runStarted(1, [{ ordinal: 2, status: "running" }])).toBe(true);
+  expect(runStarted(2, [{ ordinal: 2, status: "running" }])).toBe(false);
 });
 
 test("a suffixed respawn can reclaim a reserved name only after the base seat is gone", () => {

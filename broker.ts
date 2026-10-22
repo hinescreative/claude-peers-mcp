@@ -302,6 +302,7 @@ db.run(`
 `);
 try { db.run("ALTER TABLE peer_routes ADD COLUMN requested_id TEXT"); } catch { /* already there */ }
 try { db.run("ALTER TABLE peer_routes ADD COLUMN effective_id TEXT"); } catch { /* already there */ }
+try { db.run("ALTER TABLE peer_routes ADD COLUMN session TEXT"); } catch { /* already there */ }
 try { db.run("ALTER TABLE peers ADD COLUMN requested_id TEXT"); } catch { /* already there */ }
 
 const parsedRouteTtl = Number(process.env.CLAUDE_PEERS_ROUTE_TTL_MS ?? String(7 * 24 * 60 * 60 * 1000));
@@ -330,25 +331,29 @@ function rememberRoute(row: {
   runtime: string | null;
   pid: number | null;
   requestedId?: string | null;
+  session?: string | null;
 }): void {
   if (!row.cwd) return;
   const stable = row.requestedId || row.id;
-  const baseWriter = row.id === stable ? 1 : 0;
+  if (row.id !== stable) return;
+  const other = db.query("SELECT machine FROM peer_routes WHERE id = ? AND machine <> ?").get(stable, row.machine) as { machine: string } | null;
+  if (other) {
+    console.error(`[claude-peers broker] route ${stable} belongs to ${other.machine}; refused a write from ${row.machine}`);
+    return;
+  }
   db.run(
-    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, session, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        machine = excluded.machine,
-       cwd = CASE WHEN ? = 1 THEN excluded.cwd ELSE peer_routes.cwd END,
-       runtime = CASE WHEN ? = 1 THEN excluded.runtime ELSE peer_routes.runtime END,
-       pid = CASE WHEN ? = 1 THEN excluded.pid ELSE peer_routes.pid END,
-       effective_id = CASE WHEN ? = 1 THEN excluded.effective_id ELSE peer_routes.effective_id END,
+       cwd = excluded.cwd,
+       runtime = excluded.runtime,
+       pid = excluded.pid,
+       effective_id = excluded.effective_id,
+       session = COALESCE(peer_routes.session, excluded.session),
        requested_id = COALESCE(peer_routes.requested_id, excluded.requested_id),
-       updated_at = CASE WHEN ? = 1 THEN excluded.updated_at ELSE peer_routes.updated_at END`,
-    [
-      stable, row.machine, row.cwd, row.runtime, row.pid, stable, row.id, new Date().toISOString(),
-      baseWriter, baseWriter, baseWriter, baseWriter, baseWriter,
-    ],
+       updated_at = excluded.updated_at`,
+    [stable, row.machine, row.cwd, row.runtime, row.pid, stable, row.id, row.session ?? null, new Date().toISOString()],
   );
 }
 
@@ -777,8 +782,12 @@ function replacePeerRegistration(
   const carriedContextNote = contextNote === "" ? (prior?.context_note ?? "") : contextNote;
   const parentId = normalizeParentId(body.parent_id) ?? prior?.parent_id ?? null;
   const requested = normalizeRequestedId(body.requested_id);
-  const saved = requested ? freshRoute(requested) : null;
-  const runtime = mergeRuntime(normalizeRuntime(body.runtime), saved?.runtime ?? prior?.runtime ?? null);
+  const isBase = !requested || requested === id;
+  const saved = isBase && requested ? freshRoute(requested, machine) : null;
+  const runtime = mergeRuntime(
+    normalizeRuntime(body.runtime),
+    isBase ? (saved?.runtime ?? prior?.runtime ?? null) : (prior?.runtime ?? null),
+  );
   const rings = normalizeRings(body.rings) ?? (typeof prior?.rings === "string" ? prior.rings : normalizeRings(prior?.rings));
   const blockedOn = prior?.blocked_on ?? null;
   const blockedSince = prior?.blocked_since ?? null;
@@ -822,8 +831,9 @@ function replacePeerRegistration(
   );
   const stable = requested ?? id;
   db.run("UPDATE peers SET requested_id = ? WHERE id = ?", [stable, id]);
-  if (body.cwd) {
-    rememberRoute({ id, machine, cwd: body.cwd, runtime, pid: body.pid, requestedId: stable });
+  if (isBase && body.cwd) {
+    const session = typeof body.session === "string" && body.session.trim() ? body.session.trim().slice(0, 80) : null;
+    rememberRoute({ id, machine, cwd: body.cwd, runtime, pid: body.pid, requestedId: stable, session });
   }
 }
 
@@ -882,19 +892,28 @@ function liveLeaseFor(id: string): PeerLease | null {
 //   3. Otherwise the base belongs to a different live instance: take our own
 //      suffixed id, lengthening the hash if that exact id is somehow held by
 //      another instance, and give up rather than spin forever.
-function resolveRegistrationId(base: string, instanceId: string): string {
-  // The base is the mailbox. Take it whenever it is free, even if this
-  // process currently holds a suffix. A suffix inherits nothing.
+function heirSession(base: string): string | null {
+  const row = db.query("SELECT session FROM peer_routes WHERE id = ?").get(base) as { session: string | null } | null;
+  return row?.session || null;
+}
+
+function resolveRegistrationId(base: string, instanceId: string, session: string | null): string {
   const held = liveLeaseFor(base);
-  if (!held || held.instance_id === instanceId) return base;
+  const reserved = Object.values(nicknameAllowlist()).includes(base);
+  if (reserved) {
+    const heir = heirSession(base);
+    const sameSession = !heir || (session !== null && session === heir);
+    if (sameSession && (!held || held.instance_id === instanceId)) return base;
+  } else if (!held || held.instance_id === instanceId) {
+    return base;
+  }
   for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
     const candidate = suffixedPeerId(base, instanceId, length);
     const lease = liveLeaseFor(candidate);
     if (lease && lease.instance_id === instanceId) return candidate;
   }
 
-  const baseLease = liveLeaseFor(base);
-  if (!baseLease || baseLease.instance_id === instanceId) return base;
+  if (!reserved && (!held || held.instance_id === instanceId)) return base;
 
   for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
     const candidate = suffixedPeerId(base, instanceId, length);
@@ -936,7 +955,8 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   // payload_version 1 clients send no instance_id and cannot be disambiguated,
   // so they keep the pre-existing behaviour exactly.
-  const effectiveId = usesLeaseProtocol && instanceId ? resolveRegistrationId(id, instanceId) : id;
+  const session = typeof body.session === "string" && body.session.trim() ? body.session.trim().slice(0, 80) : null;
+  const effectiveId = usesLeaseProtocol && instanceId ? resolveRegistrationId(id, instanceId, session) : id;
 
   const currentLease = getPeerLease(effectiveId);
   if (!usesLeaseProtocol) {
@@ -1099,6 +1119,16 @@ function handleSetRuntime(body: { id?: string; runtime?: unknown } & LeaseCreden
     | null;
   if (row?.cwd) rememberRoute({ id: row.id, machine: row.machine, cwd: row.cwd, runtime, pid: row.pid });
   return { ok: true, found: true, runtime };
+}
+
+function handleSetHeir(body: { base_id?: string; session?: string }): { ok: boolean; error?: string } {
+  const base = typeof body?.base_id === "string" ? body.base_id.trim() : "";
+  const session = typeof body?.session === "string" ? body.session.trim().slice(0, 80) : "";
+  if (!base || !session) throw new HttpError(400, "set-heir requires base_id and session");
+  if (!Object.values(nicknameAllowlist()).includes(base)) throw new HttpError(403, "set-heir is only for a reserved id");
+  const updated = db.run("UPDATE peer_routes SET session = ?, updated_at = ? WHERE id = ?", [session, new Date().toISOString(), base]);
+  if (updated.changes === 0) return { ok: false, error: "no route for that id" };
+  return { ok: true };
 }
 
 function handleSetContext(body: SetContextRequest): void {
@@ -1267,7 +1297,7 @@ async function forwardWake(target: { to_id: string; machine: string; cwd: string
         pid: target.pid,
         command_id: target.command_id ?? null,
       }),
-      signal: AbortSignal.timeout(8_000),
+      signal: AbortSignal.timeout(70_000),
     });
     const json = await res.json().catch(() => null) as { ok?: boolean; error?: string; threadId?: string; dispatchMode?: string; tmux?: string } | null;
     if (json?.error === "no-route") return { ok: false, error: "no-route" };
@@ -1292,26 +1322,21 @@ async function handleSendMessage(body: SendMessageRequest) {
   if (wakesInFlight.has(stored.message_id)) {
     return { ok: true, message_id: stored.message_id, duplicate: true, wake: "pending" };
   }
-  wakesInFlight.add(stored.message_id);
-  let woke: { ok: boolean; error?: string; threadId?: string | null; dispatchMode?: string | null };
-  try {
-    woke = await forwardWake({ ...stored.bell, command_id: stored.command_id });
-  } finally {
-    wakesInFlight.delete(stored.message_id);
-  }
-  const wake = woke.ok ? "sent" : woke.error === "no-route" ? "no-route" : woke.error === "bell-unconfigured" ? "unconfigured" : "failed";
-  if (stored.message_id) db.run("UPDATE messages SET wake_state = ? WHERE id = ?", [wake, stored.message_id]);
-  const { bell: _bell, ...rest } = stored;
-  // The mail is already stored. A missed wake is not a failed send, so a poll
-  // still works and a retry with the same client_message_id can try the wake again.
-  return { ...rest, ok: true, wake, threadId: woke.ok ? woke.threadId ?? null : null, dispatchMode: woke.ok ? woke.dispatchMode ?? null : null };
+  const messageId = stored.message_id;
+  wakesInFlight.add(messageId);
+  void forwardWake({ ...stored.bell, command_id: stored.command_id }).then((woke) => {
+    const wake = woke.ok ? "sent" : woke.error === "no-route" ? "no-route" : woke.error === "bell-unconfigured" ? "unconfigured" : "failed";
+    db.run("UPDATE messages SET wake_state = ? WHERE id = ?", [wake, messageId]);
+  }).finally(() => { wakesInFlight.delete(messageId); });
+  return { ok: true, message_id: messageId, duplicate: Boolean(stored.duplicate), wake: "pending" };
 }
 
-function freshRoute(id: string): { id: string; machine: string; cwd: string; runtime: string | null; pid: number } | null {
+function freshRoute(id: string, machine?: string): { id: string; machine: string; cwd: string; runtime: string | null; pid: number } | null {
   const row = db.query("SELECT id, machine, cwd, runtime, pid, updated_at FROM peer_routes WHERE id = ?").get(id) as
     | { id: string; machine: string; cwd: string; runtime: string | null; pid: number; updated_at: string }
     | null;
   if (!row || !routeIsFresh(row.updated_at, Date.now(), ROUTE_TTL_MS)) return null;
+  if (machine && row.machine !== machine) return null;
   return row;
 }
 
@@ -1468,6 +1493,8 @@ Bun.serve({
           return Response.json(await handleSendMessage(body as SendMessageRequest));
         case "/set-runtime":
           return Response.json(handleSetRuntime(body as { id?: string; runtime?: unknown } & LeaseCredentials));
+        case "/set-heir":
+          return Response.json(handleSetHeir(body as { base_id?: string; session?: string }));
         case "/reap-dead": {
           const reapBody = body as { id?: string; peer_id?: string; pid?: number; machine?: string } & LeaseCredentials;
           const reaped = handleReapDead(reapBody);
