@@ -5,17 +5,22 @@ import { formatSendResult, SEND_DEADLINE_MS } from "./shared/message-contract.ts
 import {
   WAKE_TEXT,
   bellPeerId,
+  loadAllowlist,
   loadBells,
   loadRouteTable,
   mergeRuntime,
   needsWake,
+  nicknameDecision,
   normalizeRuntime,
   parentChanged,
+  parentSession,
   planDispatch,
+  validSession,
   resolveRoute,
   retryDispatch,
   routeIsFresh,
   shareWake,
+  shouldReaskBase,
   wakeCommandId,
 } from "./bell-protocol.ts";
 
@@ -80,6 +85,28 @@ test("a running turn queues; a released thread starts", () => {
   expect(WAKE_TEXT).toBe("peers mail waiting; run check_messages");
 });
 
+test("nicknames are unique among live peers, and assistant is reserved", () => {
+  const allowlist = loadAllowlist('{"assistant":"mac-assistant-claude-no-tty"}');
+  const live = [
+    { id: "mac-other", nickname: "Fable" },
+    { id: "mac-assistant-claude-no-tty", nickname: "assistant" },
+  ];
+  expect(nicknameDecision({ callerId: "mac-new", nickname: "Fable", live, allowlist }).ok).toBe(false);
+  expect(nicknameDecision({ callerId: "mac-other", nickname: "Fable", live, allowlist })).toEqual({ ok: true, clearIds: [] });
+  expect(nicknameDecision({ callerId: "mac-new", nickname: "Assistant", live, allowlist })).toEqual({
+    ok: false,
+    error: "nickname reserved",
+  });
+  const takeback = nicknameDecision({
+    callerId: "mac-assistant-claude-no-tty",
+    nickname: "assistant",
+    live: [...live, { id: "mac-impostor", nickname: "assistant" }],
+    allowlist,
+  });
+  expect(takeback).toEqual({ ok: true, clearIds: ["mac-impostor"] });
+  expect(nicknameDecision({ callerId: "mac-new", nickname: "   ", live, allowlist })).toEqual({ ok: true, clearIds: [] });
+});
+
 const FORK = "mcp:3e3e7dbd-4ab2-454b-8ae2-cebf0a87193c:fork";
 
 test("a T3 fork id is a thread id, in a route file and in a runtime", () => {
@@ -129,6 +156,8 @@ test("a lost dispatch response is not retried, and a parent change is noticed", 
   expect(parentChanged(10, 11)).toBe(true);
   expect(parentChanged(10, 10)).toBe(false);
   expect(parentChanged(1, 50)).toBe(false);
+  expect(shouldReaskBase("mac-assistant-claude-no-tty", "mac-assistant-claude-no-tty-ab12")).toBe(true);
+  expect(shouldReaskBase("mac-assistant-claude-no-tty", "mac-assistant-claude-no-tty")).toBe(false);
 });
 
 test("turn state is read from projection.runs, and a timeout is not a retry", () => {
@@ -159,6 +188,26 @@ test("only a single live worktree thread matches by path; a project root does no
     threads: [{ id: plain, worktreePath: worktree }],
   });
   expect("threadId" in one && one.threadId).toBe(plain);
+  expect(parentSession("claude --resume e58d40fb-1111-4111-8111-111111111111 --model x")).toBe("e58d40fb-1111-4111-8111-111111111111");
+  expect(parentSession("claude --resume --model grok")).toBe(null);
+  expect(validSession("--model")).toBe(null);
+  expect(validSession("e58d40fb-1111-4111-8111-111111111111")).toBe("e58d40fb-1111-4111-8111-111111111111");
+});
+
+test("only the base id may hold a reserved nickname, even after the base is gone", () => {
+  const allowlist = loadAllowlist('{"assistant":"mac-assistant-claude-no-tty"}');
+  expect(nicknameDecision({
+    callerId: "mac-assistant-claude-no-tty-ab12",
+    nickname: "assistant",
+    live: [],
+    allowlist,
+  }).ok).toBe(false);
+  expect(nicknameDecision({
+    callerId: "mac-assistant-claude-no-tty",
+    nickname: "assistant",
+    live: [],
+    allowlist,
+  }).ok).toBe(true);
 });
 
 test("wakeCommandId is stable for a message id", () => {
@@ -208,7 +257,7 @@ test("senders wait 10 seconds and print the wake line", () => {
   }
 });
 
-test("bell files reject a bad url and a bad route", () => {
+test("bell files reject a bad url, a bad route, and a nameless reservation", () => {
   expect(bellPeerId("mac")).toBe("bell-mac");
   expect(bellPeerId("MacBook-Air.local")).toBe("bell-MacBook-Air-local");
   expect(loadBells('{"bells":{"mac":"http://100.103.170.84:8812"}}')).toEqual({ mac: "http://100.103.170.84:8812" });

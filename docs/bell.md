@@ -16,7 +16,13 @@ A cwd match is only for a path under `~/.t3/worktrees/` with exactly one live th
 
 An id is first-come: whoever registers while the base is free holds it. A second process in the same directory gets a suffixed id. A suffixed id belongs to one process. Mail addressed to a suffix after that process exits is not recoverable. Senders target a stable id or a nickname. A suffix never reads or writes the base route, and a route is not moved to another machine.
 
-Nicknames are whatever the seat sets, the same as main. Reserved names and `set-heir` are not in this branch.
+A reserved id is granted only to a v2 Claude-harness process whose session is a uuid equal to the recorded heir. That session takes the base at once, even if an older process still holds a live lease. No heir recorded means nobody gets the base. A v1 caller or a sessionless caller never gets it. A suffix cannot take the reserved nickname.
+
+When the Assistant moves to a new thread, one call rotates the heir, the route, the old binding and the old lease. A later reap cannot put the old thread back:
+
+`curl -s -H "Authorization: Bearer $CLAUDE_PEERS_TOKEN" -H "content-type: application/json" -d '{"base_id":"mac-assistant-claude-no-tty","session":"<session-uuid>","thread_id":"mcp:<uuid>:fork","machine":"mac"}' "$CLAUDE_PEERS_BROKER_URL/set-heir"`
+
+The bearer is the fleet token. Spoofing a session uuid is the same trust as holding that bearer.
 
 Nothing sets step 2 today. `server.ts` and `codex-server.ts` will register `claude:t3:<id>` or `codex:t3:<id>` if `CLAUDE_PEERS_THREAD_ID` or `T3_THREAD_ID` is in the environment. T3 does not put either there. The tool that sets it by hand is `set_route` with `thread_id`. No AGENTS.md line calls it, and a seat cannot see its own thread id from the environment, so a startup line would have nothing to pass. Until something records the id, a root-cwd seat is a `routes.json` entry.
 

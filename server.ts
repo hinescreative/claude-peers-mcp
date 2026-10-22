@@ -43,7 +43,7 @@ import { createConnection } from "node:net";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
-import { THREAD_ID } from "./bell-protocol.ts";
+import { THREAD_ID, parentSession, shouldReaskBase } from "./bell-protocol.ts";
 
 // --- Configuration ---
 
@@ -1221,7 +1221,17 @@ function registrationPayload(summary: string) {
     machine: MACHINE_NAME,
     summary,
     runtime: registeredRuntime(),
+    session: readParentSession(),
   };
+}
+
+function readParentSession(): string | null {
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "command=", "-p", String(process.ppid)]);
+    return parentSession(new TextDecoder().decode(proc.stdout));
+  } catch {
+    return null;
+  }
 }
 
 function registeredRuntime(): string {
@@ -1335,6 +1345,8 @@ async function heartbeatLoop(): Promise<void> {
         myRole = "unregistered";
         myLeaseId = null;
         myLeaseExpiresAt = null;
+        await registerUntilActive(mySummary);
+      } else if (shouldReaskBase(myRequestedId, myId)) {
         await registerUntilActive(mySummary);
       }
     } catch (error) {
