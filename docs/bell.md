@@ -12,6 +12,10 @@ A running turn is `queue_after_active`. Anything else is `start_immediately`. A 
 2. `runtime` of `t3:<threadId>` or `<harness>:t3:<threadId>`
 3. one thread whose worktree path equals the peer's cwd
 
+A seat whose T3 project is the checkout root has `worktreePath: null`. Step 3 cannot see it. That seat needs step 1 or step 2. The Assistant fork is one of these.
+
+Nothing sets step 2 today. `server.ts` and `codex-server.ts` will register `claude:t3:<id>` or `codex:t3:<id>` if `CLAUDE_PEERS_THREAD_ID` or `T3_THREAD_ID` is in the environment. T3 does not put either there. The tool that sets it by hand is `set_route` with `thread_id`. No AGENTS.md line calls it, and a seat cannot see its own thread id from the environment, so a startup line would have nothing to pass. Until something records the id, a root-cwd seat is a `routes.json` entry.
+
 Otherwise the sender gets `no-route`. How that was chosen: `docs/bell-route-discovery-2026-10-22.md`.
 
 ## Files that are not loaded yet
