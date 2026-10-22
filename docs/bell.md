@@ -14,9 +14,11 @@ A running turn is `queue_after_active`. Anything else is `start_immediately`. A 
 
 A cwd match is only for a path under `~/.t3/worktrees/` with exactly one live thread that is not a fork. T3 makes one worktree per thread, so that is unique. A project root, including the Assistant, resolves only by an explicit route.
 
-An unreserved id is first-come: whoever registers while the base is free holds it. A reserved id is granted only to a v2 Claude-harness process whose session is a uuid equal to the recorded heir. No heir recorded means nobody gets the base. A v1 caller or a sessionless caller never gets it. A suffix cannot take the reserved nickname.
+An unreserved id is first-come: whoever registers while the base is free holds it. A reserved id is granted only to a v2 Claude-harness process whose session is a uuid equal to the recorded heir. That session takes the base at once, even if an older process still holds a live lease. No heir recorded means nobody gets the base. A v1 caller or a sessionless caller never gets it. A suffix cannot take the reserved nickname.
 
-When the Assistant moves to a new thread, one call rotates the heir, the route and the old binding:
+A suffixed id belongs to one process. Mail addressed to a suffix after that process exits is not recoverable. Senders target a stable id or a nickname.
+
+When the Assistant moves to a new thread, one call rotates the heir, the route, the old binding and the old lease. A later reap cannot put the old thread back:
 
 `curl -s -H "Authorization: Bearer $CLAUDE_PEERS_TOKEN" -H "content-type: application/json" -d '{"base_id":"mac-assistant-claude-no-tty","session":"<session-uuid>","thread_id":"mcp:<uuid>:fork","machine":"mac"}' "$CLAUDE_PEERS_BROKER_URL/set-heir"`
 
@@ -36,6 +38,19 @@ Otherwise the sender gets `no-route`. How that was chosen: `docs/bell-route-disc
 The T3 credential is `BELL_T3` (default `~/.local/state/peers-bell/t3.json`): `baseUrl`, `token`, `environmentId`. Mode 600, owned by the user running the bell. The bell refuses anything looser. Not in git.
 
 A route is kept for 7 days (`CLAUDE_PEERS_ROUTE_TTL_MS`). A thread id in a route or a runtime is used only while that thread is still in the shell snapshot and not archived. A cwd match is refused when an archived thread already used that path, so a leftover fork is not woken by mistake.
+
+## Deploy order
+
+Do these in order. Skipping the heir step lets the next Assistant registration lose the base.
+
+1. Merge.
+2. Update the Mac Claude peers client.
+3. Run the set-heir curl above for `mac-assistant-claude-no-tty` with the Assistant's current session and thread, before its next release.
+4. Restart theoldone's broker.
+5. Load the Mac bell.
+6. Retire theoldone's grok-edge patch.
+
+`~/bin/peers` is an installed copy of `cli.ts`. Reinstall it from `cli.ts` after the client update. Do not edit that copy from a worktree.
 
 ## Rollback
 

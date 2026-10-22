@@ -12,6 +12,8 @@
  *   bun cli.ts kill-broker     — Stop the broker daemon (local only)
  */
 
+import { formatSendResult, SEND_DEADLINE_MS } from "./shared/message-contract.ts";
+
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BROKER_PORT}`;
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
@@ -34,7 +36,7 @@ async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
     : {};
   const res = await fetch(`${BROKER_URL}${path}`, {
     ...opts,
-    signal: AbortSignal.timeout(3000),
+    signal: AbortSignal.timeout(SEND_DEADLINE_MS),
   });
   if (!res.ok) {
     throw new Error(`${res.status}: ${await res.text()}`);
@@ -125,15 +127,17 @@ switch (cmd) {
       process.exit(1);
     }
     try {
-      const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+      const result = await brokerFetch<{ ok: boolean; error?: string; message_id?: number; wake?: string }>("/send-message", {
         from_id: "cli",
         to_id: toId,
         text: msg,
       });
-      if (result.ok) {
-        console.log(`Message sent to ${toId}`);
+      const formatted = formatSendResult(toId, result);
+      if (!result.ok || formatted.isError) {
+        console.error(result.ok ? formatted.text : `Failed: ${result.error}`);
+        process.exitCode = 1;
       } else {
-        console.error(`Failed: ${result.error}`);
+        console.log(formatted.text);
       }
     } catch (e) {
       console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);

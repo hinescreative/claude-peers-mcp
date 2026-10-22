@@ -22,9 +22,9 @@ let bellHold: Promise<void> | null = null;
 const bell = Bun.serve({
   port: BELL_PORT,
   fetch: async (req) => {
-    const body = await req.json() as { command_id?: string };
-    if (bellHold) await bellHold;
+    const body = await req.json() as { command_id?: string; message_id?: number };
     wakes.push({ body, auth: req.headers.get("Authorization"), command_id: body.command_id });
+    if (bellHold) await bellHold;
     if (bellMode === "no-route") return Response.json({ ok: false, error: "no-route" });
     return Response.json({ ok: true, threadId: "mcp:36a41ff7-8eef-49ab-a947-55027c14f468", dispatchMode: "queue_after_active" });
   },
@@ -365,4 +365,180 @@ test("a bell that does not answer within 4 seconds comes back failed, with the m
   expect(sent.json.ok).toBe(true);
   expect(sent.json.wake).toBe("failed");
   expect(sent.json.message_id).toBeGreaterThan(0);
+});
+
+test("a send never returns pending", async () => {
+  const sent = await post("/send-message", {
+    from_id: "mac-sender", to_id: "codex-lost", text: "terminal", client_message_id: "no-pending-1",
+  });
+  expect(sent.status).toBe(200);
+  expect(sent.json.ok).toBe(true);
+  expect(sent.json.wake).not.toBe("pending");
+  expect(["sent", "failed", "no-route", "unconfigured", "skipped"]).toContain(sent.json.wake);
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(DB, { readonly: true });
+  const row = db.query("SELECT wake_state FROM messages WHERE id = ?").get(sent.json.message_id) as { wake_state: string | null };
+  const columns = db.query("PRAGMA table_info(messages)").all() as { name: string }[];
+  db.close();
+  expect(row.wake_state).not.toBe("pending");
+  expect(columns.some((column) => column.name === "wake_command_id")).toBe(false);
+});
+
+test("a retry after the bell times out repeats the same message id", async () => {
+  bellHold = new Promise(() => {});
+  const marker = wakes.length;
+  const first = await post("/send-message", {
+    from_id: "mac-sender", to_id: "codex-lost", text: "late", client_message_id: "late-1",
+  });
+  expect(first.json.wake).toBe("failed");
+  expect(first.json.wake).not.toBe("pending");
+  bellHold = null;
+  const again = await post("/send-message", {
+    from_id: "mac-sender", to_id: "codex-lost", text: "late", client_message_id: "late-1",
+  });
+  expect(again.json.message_id).toBe(first.json.message_id);
+  expect(again.json.wake).toBe("sent");
+  expect(wakes[marker]?.body.message_id).toBe(first.json.message_id);
+  expect(wakes.at(-1)?.body.message_id).toBe(first.json.message_id);
+}, 15_000);
+
+test("a bookkeeping failure still returns the accepted message", async () => {
+  let release: () => void = () => {};
+  bellHold = new Promise<void>((resolve) => { release = resolve; });
+  const marker = wakes.length;
+  const inflight = post("/send-message", {
+    from_id: "mac-sender", to_id: "codex-lost", text: "locked", client_message_id: "locked-1",
+  });
+  for (let i = 0; i < 50 && wakes.length === marker; i++) await Bun.sleep(20);
+  expect(wakes.length).toBe(marker + 1);
+  const { Database } = await import("bun:sqlite");
+  const lock = new Database(DB);
+  lock.run("PRAGMA busy_timeout = 2000");
+  lock.exec("BEGIN EXCLUSIVE");
+  release();
+  const sent = await inflight;
+  lock.exec("ROLLBACK");
+  lock.close();
+  bellHold = null;
+  expect(sent.status).toBe(200);
+  expect(sent.json.ok).toBe(true);
+  expect(sent.json.message_id).toBeGreaterThan(0);
+  expect(sent.json.wake).toBe("sent");
+  const check = new Database(DB, { readonly: true });
+  const row = check.query("SELECT wake_state FROM messages WHERE id = ?").get(sent.json.message_id) as { wake_state: string | null };
+  check.close();
+  expect(row.wake_state).toBeNull();
+}, 10_000);
+
+test("a resumed heir session takes the base while the old lease is live", async () => {
+  const session = "33333333-3333-4333-8333-333333333333";
+  const sleeps = [Bun.spawn(["sleep", "40"]), Bun.spawn(["sleep", "40"])];
+  const [oldPid, newPid] = sleeps.map((child) => child.pid);
+  try {
+    expect((await post("/set-heir", {
+      base_id: "mac-assistant-claude-no-tty",
+      session,
+      thread_id: "mcp:3e3e7dbd-4ab2-454b-8ae2-cebf0a87193c:fork",
+      machine: "mac",
+    })).json.ok).toBe(true);
+    const first = await post("/register", {
+      ...seat("mac-assistant-claude-no-tty", { pid: oldPid, cwd: "/tmp/heir-live", runtime: "claude" }),
+      instance_id: "heir-live-old",
+      payload_version: 2,
+      session,
+    });
+    expect(first.json.id).toBe("mac-assistant-claude-no-tty");
+    const resumed = await post("/register", {
+      ...seat("mac-assistant-claude-no-tty", { pid: newPid, cwd: "/tmp/heir-live", runtime: "claude" }),
+      instance_id: "heir-live-new",
+      payload_version: 2,
+      session,
+    });
+    expect(resumed.status).toBe(200);
+    expect(resumed.json.id).toBe("mac-assistant-claude-no-tty");
+    expect(resumed.json.lease_id).not.toBe(first.json.lease_id);
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(DB, { readonly: true });
+    const lease = db.query("SELECT instance_id FROM peer_leases WHERE peer_id = ?").get("mac-assistant-claude-no-tty") as { instance_id: string } | null;
+    db.close();
+    expect(lease?.instance_id).toBe("heir-live-new");
+  } finally {
+    for (const child of sleeps) child.kill();
+  }
+});
+
+test("set-heir keeps the new thread after the old row is reaped", async () => {
+  const session = "44444444-4444-4444-8444-444444444444";
+  const oldThread = "mcp:55555555-5555-4555-8555-555555555555";
+  const newThread = "mcp:66666666-6666-4666-8666-666666666666";
+  const sleeper = Bun.spawn(["sleep", "40"]);
+  const bellSleeper = Bun.spawn(["sleep", "40"]);
+  try {
+    const bell = await post("/register", {
+      ...seat("bell-mac", { pid: bellSleeper.pid, cwd: "/tmp/bell", runtime: "bell" }),
+      instance_id: "bell-mac-instance",
+      payload_version: 2,
+    });
+    expect(bell.json.id).toBe("bell-mac");
+    expect((await post("/set-heir", {
+      base_id: "mac-assistant-claude-no-tty",
+      session,
+      thread_id: oldThread,
+      machine: "mac",
+    })).json.ok).toBe(true);
+    const old = await post("/register", {
+      ...seat("mac-assistant-claude-no-tty", { pid: sleeper.pid, cwd: "/tmp/heir-reap", runtime: "claude" }),
+      instance_id: "heir-reap-old",
+      payload_version: 2,
+      session,
+    });
+    expect(old.json.id).toBe("mac-assistant-claude-no-tty");
+    expect((await post("/set-heir", {
+      base_id: "mac-assistant-claude-no-tty",
+      session,
+      thread_id: newThread,
+      machine: "mac",
+    })).json.ok).toBe(true);
+    const reaped = await post("/reap-dead", {
+      id: "bell-mac",
+      instance_id: "bell-mac-instance",
+      lease_id: bell.json.lease_id,
+      peer_id: "mac-assistant-claude-no-tty",
+      pid: sleeper.pid,
+      machine: "mac",
+    });
+    expect(reaped.json.reaped).toBe(true);
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(DB, { readonly: true });
+    const route = db.query("SELECT runtime, session FROM peer_routes WHERE id = ? AND machine = ?").get("mac-assistant-claude-no-tty", "mac") as { runtime: string; session: string };
+    db.close();
+    expect(route.runtime).toBe(`claude:t3:${newThread}`);
+    expect(route.session).toBe(session);
+  } finally {
+    sleeper.kill();
+    bellSleeper.kill();
+  }
+});
+
+test("a reserved heir on one machine is not the heir on another", async () => {
+  const session = "77777777-7777-4777-8777-777777777777";
+  const sleeper = Bun.spawn(["sleep", "30"]);
+  try {
+    expect((await post("/set-heir", {
+      base_id: "mac-assistant-claude-no-tty",
+      session,
+      thread_id: "mcp:88888888-8888-4888-8888-888888888888",
+      machine: "mac",
+    })).json.ok).toBe(true);
+    const other = await post("/register", {
+      ...seat("mac-assistant-claude-no-tty", { pid: sleeper.pid, machine: "pc", runtime: "claude", cwd: "/tmp/other-machine" }),
+      instance_id: "heir-other-machine",
+      payload_version: 2,
+      session,
+    });
+    expect(other.status).toBe(200);
+    expect(String(other.json.id).startsWith("mac-assistant-claude-no-tty-")).toBe(true);
+  } finally {
+    sleeper.kill();
+  }
 });

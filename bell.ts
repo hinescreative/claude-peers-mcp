@@ -5,7 +5,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { bellPeerId, loadRouteTable, pidAlive, planWake, type RouteOverride } from "./bell-protocol.ts";
+import { bellPeerId, loadRouteTable, pidAlive, planWake, shareWake, wakeCommandId, type RouteOverride } from "./bell-protocol.ts";
 import { dispatchToThread, readShell, type T3Auth } from "./bell-dispatch.ts";
 
 const PEER_ID_RE = /^[a-zA-Z0-9_-]{3,64}$/;
@@ -102,7 +102,16 @@ export async function start() {
     }
   }
 
+  const wakeMemory = new Map<string, { at: number; result: Promise<Record<string, unknown>> }>();
+
   async function wake(body: any) {
+    const messageId = Number.isSafeInteger(body?.message_id) ? Number(body.message_id) : null;
+    const run = () => deliverWake(body, messageId === null ? null : wakeCommandId(messageId));
+    if (messageId === null) return run();
+    return shareWake(wakeMemory, String(messageId), Date.now(), 10 * 60 * 1000, run);
+  }
+
+  async function deliverWake(body: any, commandId: string | null) {
     const toId = typeof body?.to_id === "string" ? body.to_id : "";
     if (!PEER_ID_RE.test(toId)) return { ok: false, error: "no-route" };
     let threads: { id: string; worktreePath: string | null; archivedAt: string | null; latestTurnState: string | null }[] | undefined;
@@ -133,8 +142,8 @@ export async function start() {
     }
     let auth: T3Auth;
     try { auth = loadT3Auth(t3Path); } catch { return { ok: false, error: "credential-unavailable" }; }
+    if (!commandId) return { ok: false, error: "dispatch-failed" };
     try {
-      const commandId = typeof body?.command_id === "string" && body.command_id ? body.command_id : undefined;
       const sent = await dispatchToThread(auth, planned.threadId, planned.text, planned.dispatchMode, commandId);
       log(`woke ${toId} ${sent.dispatchMode}`);
       return { ok: true, to_id: toId, threadId: planned.threadId, dispatchMode: sent.dispatchMode };

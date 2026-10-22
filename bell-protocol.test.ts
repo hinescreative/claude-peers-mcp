@@ -1,6 +1,7 @@
+import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
-import { dispatchTimedOut, runStatus } from "./bell-dispatch.ts";
-import { formatSendResult } from "./shared/message-contract.ts";
+import { dispatchTimedOut, runStatus, T3_HTTP_TIMEOUT_MS } from "./bell-dispatch.ts";
+import { formatSendResult, SEND_DEADLINE_MS } from "./shared/message-contract.ts";
 import {
   WAKE_TEXT,
   bellPeerId,
@@ -18,7 +19,9 @@ import {
   resolveRoute,
   retryDispatch,
   routeIsFresh,
+  shareWake,
   shouldReaskBase,
+  wakeCommandId,
 } from "./bell-protocol.ts";
 
 const THREAD = "mcp:36a41ff7-8eef-49ab-a947-55027c14f468";
@@ -205,6 +208,53 @@ test("only the base id may hold a reserved nickname, even after the base is gone
     live: [],
     allowlist,
   }).ok).toBe(true);
+});
+
+test("wakeCommandId is stable for a message id", () => {
+  expect(wakeCommandId(42)).toBe(wakeCommandId(42));
+  expect(wakeCommandId(42)).not.toBe(wakeCommandId(43));
+  expect(wakeCommandId(42)[14]).toBe("5");
+});
+
+test("one message shares one wake outcome", async () => {
+  const memory = new Map<string, { at: number; result: Promise<string> }>();
+  let calls = 0;
+  const run = () => {
+    calls += 1;
+    return Promise.resolve("sent");
+  };
+  const [first, second] = await Promise.all([
+    shareWake(memory, "9", 1_000, 600_000, run),
+    shareWake(memory, "9", 1_000, 600_000, run),
+  ]);
+  expect(first).toBe("sent");
+  expect(second).toBe("sent");
+  expect(calls).toBe(1);
+  const later = await shareWake(memory, "9", 1_000 + 60_000, 600_000, run);
+  expect(later).toBe("sent");
+  expect(calls).toBe(1);
+});
+
+test("T3 HTTP calls give up at 3 seconds", () => {
+  expect(T3_HTTP_TIMEOUT_MS).toBe(3_000);
+  const source = readFileSync(new URL("./bell-dispatch.ts", import.meta.url), "utf8");
+  expect(source).toContain("AbortSignal.timeout(T3_HTTP_TIMEOUT_MS)");
+  expect(source).toContain("T3_HTTP_TIMEOUT_MS);");
+  expect(source).not.toContain("15000");
+  expect(source).not.toContain("crypto.randomUUID");
+});
+
+test("senders wait 10 seconds and print the wake line", () => {
+  expect(SEND_DEADLINE_MS).toBe(10_000);
+  const sent = formatSendResult("codex-only", { ok: true, message_id: 8, wake: "sent" });
+  expect(sent.text).toContain("wake: sent");
+  expect(sent.isError).toBe(false);
+  const cli = readFileSync(new URL("./cli.ts", import.meta.url), "utf8");
+  const direct = readFileSync(new URL("./codex-direct.ts", import.meta.url), "utf8");
+  for (const source of [cli, direct]) {
+    expect(source).toContain("AbortSignal.timeout(SEND_DEADLINE_MS)");
+    expect(source).toContain("formatSendResult");
+  }
 });
 
 test("bell files reject a bad url, a bad route, and a nameless reservation", () => {

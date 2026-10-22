@@ -2,6 +2,11 @@
 // Same dispatch lead-wake uses. Never steers and never restarts a live run.
 import { retryDispatch } from "./bell-protocol.ts";
 
+export const T3_HTTP_TIMEOUT_MS = 3_000;
+// One dispatch may outlive the broker's 4s. The command id is the message id,
+// and the bell remembers that outcome, so the late finish is a replay.
+const T3_RPC_TIMEOUT_MS = 40_000;
+
 export function runStatus(snapshot: any): string | null {
   const thread = snapshot?.thread ?? snapshot?.projection ?? snapshot;
   const runs = thread?.projection?.runs ?? thread?.runs ?? snapshot?.projection?.runs;
@@ -35,7 +40,7 @@ async function http(auth: T3Auth, path: string, payload?: unknown) {
       ...(payload === undefined ? {} : { "content-type": "application/json" }),
     },
     ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(T3_HTTP_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status} at ${path}`);
   return response.json() as Promise<any>;
@@ -53,31 +58,31 @@ async function connect(auth: T3Auth) {
   url.searchParams.set("orchestrationProtocol", "2");
   url.searchParams.set("wsTicket", ticket.ticket);
   const ws = new WebSocket(url);
-  const pending = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const waiters = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   let counter = 0;
   const rejectAll = () => {
-    for (const item of pending.values()) {
+    for (const item of waiters.values()) {
       clearTimeout(item.timer);
       item.reject(new Error("RPC connection closed"));
     }
-    pending.clear();
+    waiters.clear();
   };
   ws.addEventListener("message", (event) => {
     let decoded: any;
     try { decoded = JSON.parse(String(event.data)); } catch { rejectAll(); return; }
     for (const frame of Array.isArray(decoded) ? decoded : [decoded]) {
       if (frame._tag === "Ping") { ws.send(JSON.stringify({ _tag: "Pong" })); continue; }
-      const item = pending.get(String(frame.requestId));
+      const item = waiters.get(String(frame.requestId));
       if (frame._tag === "Exit" && item) {
         clearTimeout(item.timer);
-        pending.delete(String(frame.requestId));
+        waiters.delete(String(frame.requestId));
         try { item.resolve(decodeExit(frame)); } catch (error) { item.reject(error as Error); }
       }
     }
   });
   ws.addEventListener("close", rejectAll);
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => { ws.close(); reject(new Error("WebSocket open timed out")); }, 15000);
+    const timer = setTimeout(() => { ws.close(); reject(new Error("WebSocket open timed out")); }, T3_HTTP_TIMEOUT_MS);
     ws.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
     ws.addEventListener("error", () => { clearTimeout(timer); reject(new Error("WebSocket open failed")); }, { once: true });
   });
@@ -85,8 +90,8 @@ async function connect(auth: T3Auth) {
     close: () => ws.close(),
     call: (tag: string, payload: unknown) => new Promise<any>((resolve, reject) => {
       const id = String(++counter);
-      const timer = setTimeout(() => { pending.delete(id); reject(new Error(`RPC ${tag} timed out`)); }, 40000);
-      pending.set(id, { resolve, reject, timer });
+      const timer = setTimeout(() => { waiters.delete(id); reject(new Error(`RPC ${tag} timed out`)); }, T3_RPC_TIMEOUT_MS);
+      waiters.set(id, { resolve, reject, timer });
       ws.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] }));
     }),
   };
@@ -141,7 +146,7 @@ export async function dispatchToThread(
   threadId: string,
   text: string,
   dispatchMode: { type: "start_immediately" } | { type: "queue_after_active" },
-  commandId = crypto.randomUUID(),
+  commandId: string,
 ) {
   if (!auth?.baseUrl || !auth?.token) throw new Error("T3 credential is missing");
   const rpc = await connect(auth);

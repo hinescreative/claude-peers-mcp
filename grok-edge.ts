@@ -19,7 +19,7 @@
  *   GROK_PEER_ALLOWLIST      optional comma-separated to_id allowlist
  */
 
-import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { formatSendResult, messageToolProperties, SEND_DEADLINE_MS, sendPeerMessage } from "./shared/message-contract.ts";
 
 const BROKER = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://100.108.57.10:7899").replace(/\/$/, "");
 const FLEET_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
@@ -58,6 +58,7 @@ async function broker(path: string, body: unknown): Promise<any> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SEND_DEADLINE_MS),
   });
   const text = await res.text();
   let json: any;

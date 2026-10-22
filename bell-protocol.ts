@@ -1,5 +1,6 @@
 // Pure rules for the peers bell. The broker and the bell both import this so
 // "who gets a wake" and "which thread" stay the same in tests and in production.
+import { createHash } from "node:crypto";
 
 export const WAKE_TEXT = "peers mail waiting; run check_messages";
 export const NO_PUSH = new Set(["codex", "cursor", "opencode", "grok", "poll"]);
@@ -253,6 +254,36 @@ export function loadAllowlist(text: string): Record<string, string> {
     allowlist[name.trim()] = owner;
   }
   return allowlist;
+}
+
+const WAKE_NAMESPACE = "c3a1e5b0-7d24-4f6a-9b18-2e6d0a4c8f51";
+
+// UUID v5 of the message id. A retry asks T3 for the same command, which T3 dedupes.
+export function wakeCommandId(messageId: number): string {
+  const namespace = Buffer.from(WAKE_NAMESPACE.replace(/-/g, ""), "hex");
+  const hash = createHash("sha1").update(namespace).update(String(messageId)).digest();
+  const bytes = Buffer.from(hash.subarray(0, 16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function shareWake<T>(
+  memory: Map<string, { at: number; result: Promise<T> }>,
+  key: string,
+  now: number,
+  ttlMs: number,
+  run: () => Promise<T>,
+): Promise<T> {
+  for (const [id, item] of memory) {
+    if (now - item.at > ttlMs) memory.delete(id);
+  }
+  const cached = memory.get(key);
+  if (cached && now - cached.at <= ttlMs) return cached.result;
+  const result = run();
+  memory.set(key, { at: now, result });
+  return result;
 }
 
 export function loadBells(text: string): Record<string, string> {

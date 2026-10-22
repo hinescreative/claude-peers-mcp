@@ -1,6 +1,7 @@
 import type { SendMessageRequest, SendMessageResponse } from "./types.ts";
 
 export const messageContractVersion = 1;
+export const SEND_DEADLINE_MS = 10_000;
 export const messageToolProperties = {
   kind: { type: "string" as const, enum: ["request", "reply", "notification"], description: "request asks for work; reply answers an earlier request; notification needs no answer. Default request." },
   reply_to_id: { type: "integer" as const, minimum: 1, description: "Original message ID when replying. Sets kind=reply if omitted." },
