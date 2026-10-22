@@ -22,6 +22,7 @@ import {
   mergeRuntime,
   needsWake,
   normalizeRuntime,
+  parseRuntime,
   pidAlive,
   routeIsFresh,
 } from "./bell-protocol.ts";
@@ -1241,7 +1242,7 @@ async function forwardWake(target: { to_id: string; machine: string; cwd: string
         pid: target.pid,
         message_id: messageId,
       }),
-      signal: AbortSignal.timeout(4_000),
+      signal: AbortSignal.timeout(3_000),
     });
     const json = await res.json().catch(() => null) as { ok?: boolean; error?: string; threadId?: string; dispatchMode?: string; tmux?: string } | null;
     if (json?.error === "no-route") return { ok: false, error: "no-route" };
@@ -1262,7 +1263,7 @@ function withSendBusy<T>(work: () => T): T {
 }
 
 async function handleSendMessage(body: SendMessageRequest) {
-  // Handler budget: commit ≤1 s, bell ≤4 s, bookkeeping ≤1 s, under the senders' 10 s.
+  // Handler budget: commit ≤1 s, bell ≤3 s, bookkeeping ≤1 s, under the oldest sender's 5 s.
   const stored = withSendBusy(() => sendMessage(body)) as {
     ok: boolean;
     error?: string;
@@ -1294,6 +1295,28 @@ async function handleSendMessage(body: SendMessageRequest) {
     // The mail is already committed. A bookkeeping error must not hide the accepted id.
   }
   return { ok: true, message_id: messageId, duplicate: Boolean(stored.duplicate), wake };
+}
+
+function handleSeedRoute(body: { id?: string; machine?: string; runtime?: string }): { ok: boolean } {
+  const id = typeof body?.id === "string" ? body.id.trim() : "";
+  const machine = typeof body?.machine === "string" ? body.machine.trim() : "";
+  const runtime = normalizeRuntime(body?.runtime);
+  if (!/^[a-zA-Z0-9_-]{3,64}$/.test(id) || !machine || !runtime || !parseRuntime(runtime).threadId) {
+    throw new HttpError(400, "seed-route requires id, machine, and a runtime with a thread id");
+  }
+  const other = db.query("SELECT machine FROM peer_routes WHERE id = ? AND machine <> ?").get(id, machine) as { machine: string } | null;
+  if (other) {
+    console.error(`[claude-peers broker] route ${id} belongs to ${other.machine}; refused a seed from ${machine}`);
+    throw new HttpError(409, "route belongs to another machine");
+  }
+  const now = new Date().toISOString();
+  db.run(
+    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, updated_at)
+     VALUES (?, ?, '', ?, null, ?, ?, ?)
+     ON CONFLICT(id, machine) DO UPDATE SET runtime = excluded.runtime, updated_at = excluded.updated_at`,
+    [id, machine, runtime, id, id, now],
+  );
+  return { ok: true };
 }
 
 function freshRoute(id: string, machine: string): { id: string; machine: string; cwd: string; runtime: string | null; pid: number } | null {
@@ -1463,6 +1486,8 @@ Bun.serve({
           return Response.json(await handleSendMessage(body as SendMessageRequest));
         case "/set-runtime":
           return Response.json(handleSetRuntime(body as { id?: string; runtime?: unknown } & LeaseCredentials));
+        case "/seed-route":
+          return Response.json(handleSeedRoute(body as { id?: string; machine?: string; runtime?: string }));
         case "/reap-dead": {
           const reapBody = body as { id?: string; peer_id?: string; pid?: number; machine?: string } & LeaseCredentials;
           const reaped = handleReapDead(reapBody);

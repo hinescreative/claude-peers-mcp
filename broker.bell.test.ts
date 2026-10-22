@@ -281,14 +281,14 @@ test("a route is not moved to another machine", async () => {
   expect(route.runtime).toBe("claude:t3:mcp:11111111-1111-4111-8111-111111111111");
 });
 
-test("a bell that does not answer within 4 seconds comes back failed, with the mail stored", async () => {
+test("a bell that does not answer within 3 seconds comes back failed, with the mail stored", async () => {
   bellHold = new Promise<void>(() => {});
   const started = Date.now();
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "codex-lost", text: "slow", client_message_id: "slow-1" });
   const elapsed = Date.now() - started;
   bellHold = null;
-  expect(elapsed).toBeGreaterThan(3000);
-  expect(elapsed).toBeLessThan(6000);
+  expect(elapsed).toBeGreaterThan(2500);
+  expect(elapsed).toBeLessThan(3900);
   expect(sent.json.ok).toBe(true);
   expect(sent.json.wake).toBe("failed");
   expect(sent.json.message_id).toBeGreaterThan(0);
@@ -356,3 +356,27 @@ test("a bookkeeping failure still returns the accepted message", async () => {
   check.close();
   expect(row.wake_state).toBeNull();
 }, 10_000);
+
+test("a seeded route wakes a peer the broker has never seen", async () => {
+  const seeded = await post("/seed-route", {
+    id: "mac-shaw-plumbing-no-tty",
+    machine: "mac",
+    runtime: "t3:mcp:36a41ff7-8eef-49ab-a947-55027c14f468",
+  });
+  expect(seeded.status).toBe(200);
+  expect(seeded.json.ok).toBe(true);
+  const list = await post("/list-peers", { scope: "fleet", cwd: "/work/only", git_root: null });
+  expect((list.json as { id: string }[]).some((peer) => peer.id === "mac-shaw-plumbing-no-tty")).toBe(false);
+  const before = wakes.length;
+  const sent = await post("/send-message", {
+    from_id: "mac-sender",
+    to_id: "mac-shaw-plumbing-no-tty",
+    text: "seed-mail",
+  });
+  expect(sent.json.ok).toBe(true);
+  expect(sent.json.wake).toBe("sent");
+  expect(wakes.length).toBe(before + 1);
+  expect(wakes.at(-1)?.body.to_id).toBe("mac-shaw-plumbing-no-tty");
+  expect(wakes.at(-1)?.body.runtime).toBe("t3:mcp:36a41ff7-8eef-49ab-a947-55027c14f468");
+  expect(JSON.stringify(wakes.at(-1)?.body)).not.toContain("seed-mail");
+});

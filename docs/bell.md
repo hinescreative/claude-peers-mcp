@@ -33,22 +33,85 @@ The T3 credential is `BELL_T3` (default `~/.local/state/peers-bell/t3.json`): `b
 
 A route is kept for 7 days (`CLAUDE_PEERS_ROUTE_TTL_MS`). A thread id in a route or a runtime is used only while that thread is still in the shell snapshot and not archived. A cwd match is refused when an archived thread already used that path, so a leftover fork is not woken by mistake.
 
+## Known limitation
+
+Senders on pc, clarsmini, and the imac are older checkouts. Their send deadline is 5 seconds and they do not print the wake line, so `wake: no-route` looks like a success until each machine's client is updated. This broker answers inside that 5 seconds: commit ≤1 s, bell ≤3 s, bookkeeping ≤1 s.
+
+`~/bin/peers` is a Python script at `/Users/wesleyhines/bin/peers`. It is not a copy of `cli.ts`. A search of `~/hines` and `~/hines/setup` found no other copy; that file is the source. It is not changed in this PR. Follow-up, separate from this branch: print the wake line, and raise its deadline from 8 seconds to 10. Keep `peers send --from` and the nickname lookup.
+
 ## Deploy order
 
-theoldone's broker is not this branch. On 2026-10-22 it was still the tree at b112981 (PR #2, multi-token), seven commits behind main. PR #3 (redelivery, claims, leases) and PR #4 are merged on main and were not deployed. The broker process there started 2026-10-19 at 10:25 PM. theoldone also has a local grok-edge.ts patch and untracked files: lead-wake-edge.ts, dispatch.mjs, protocol.mjs, and butler-inbox-edge.ts. butler-inbox-edge.ts matches main.
+Run this only after this PR is on main. On 2026-10-22 theoldone's checkout was `b112981`, seven commits behind main, with a dirty `grok-edge.ts`. PR #3 and PR #4 were merged and not deployed. The broker process had started 2026-10-19 at 10:25 PM. The lease and claim checks do nothing until that host is running main.
 
-The lease and claim checks in the wake decision do nothing until theoldone is running main.
+theoldone, in this order. Do not restart the broker until the line that says so.
 
-Do these in order, at a quiet moment. Do not load the Mac bell before that broker is on main.
+```sh
+cp -a /home/hinescreative/mcp-servers/claude-peers-mcp /home/hinescreative/mcp-servers/claude-peers-mcp.bak-2026-10-22
+rm /home/hinescreative/mcp-servers/claude-peers-mcp/butler-inbox-edge.ts
+git -C /home/hinescreative/mcp-servers/claude-peers-mcp stash push -m "grok-edge local lead-wake patch 2026-10-22" -- grok-edge.ts
+git -C /home/hinescreative/mcp-servers/claude-peers-mcp pull --ff-only origin main
+git -C /home/hinescreative/mcp-servers/claude-peers-mcp grep -n shouldWakeLead -- grok-edge.ts
+```
 
-1. On theoldone, remove the untracked butler-inbox-edge.ts. It is the same file as main's, and a pull will not replace an untracked copy.
-2. Bring theoldone's broker checkout to main, so PR #3 and PR #4 are what is running. Restart the broker once.
-3. Replace theoldone's local grok-edge.ts patch with the matcher in this PR.
-4. Copy theoldone's lead-wake routes.json, which has Shaw, into the Mac bell's routes.json. A seat that wakes today keeps waking.
-5. Load the Mac bell.
-6. Leave lead-wake-edge.ts running on theoldone until the bell has woken Shaw's lead once. Then disable that unit.
+Stop if that grep is empty. Do not run `git stash pop`. The untracked `lead-wake-edge.ts`, `dispatch.mjs`, `protocol.mjs`, and `apply-grok-fallback.py` stay; lead-wake is still the thing that wakes Shaw until the last step.
 
-`~/bin/peers` is an installed copy of `cli.ts`. Reinstall it from `cli.ts` after the Mac client update. Do not edit that copy from a worktree.
+```sh
+mkdir -p /home/hinescreative/.config/claude-peers /home/hinescreative/.config/systemd/user/claude-peers-broker.service.d
+printf '%s\n' '{"mac":"http://100.103.170.84:8812"}' > /home/hinescreative/.config/claude-peers/bells.json
+cat > /home/hinescreative/.config/systemd/user/claude-peers-broker.service.d/bell.conf <<'EOF'
+[Service]
+Environment=CLAUDE_PEERS_BELLS=/home/hinescreative/.config/claude-peers/bells.json
+Environment=CLAUDE_PEERS_TOKENS_FILE=/home/hinescreative/.config/claude-peers/broker-tokens.txt
+EOF
+```
+
+The bell credential is the first line of that existing tokens file. Do not copy the token into a second file.
+
+```sh
+# needs Wes's go
+systemctl --user daemon-reload
+systemctl --user restart claude-peers-broker.service
+```
+
+The seed is after the restart. The broker at `b112981` has no `/seed-route`.
+
+```sh
+python3 - <<'PY'
+import json, pathlib, urllib.request
+routes = json.load(open("/home/hinescreative/.local/state/lead-wake/routes.json"))
+token = pathlib.Path("/home/hinescreative/.config/claude-peers/broker-tokens.txt").read_text().splitlines()[0].strip()
+for peer_id, route in routes["routes"].items():
+    body = json.dumps({"id": peer_id, "machine": "mac", "runtime": f"t3:{route['threadId']}"}).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:7899/seed-route",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        print(peer_id, resp.status)
+PY
+```
+
+On the Mac, after `~/hines/setup/mcp-servers/claude-peers-mcp` is on the same main. The plist path `/Users/wesleyhines/mcp-servers/claude-peers-mcp` is a symlink to that checkout.
+
+```sh
+git -C ~/hines/setup/mcp-servers/claude-peers-mcp pull --ff-only origin main
+mkdir -p ~/.local/state/peers-bell ~/Library/LaunchAgents
+fssh theoldone 'cat ~/.local/state/lead-wake/routes.json' > ~/.local/state/peers-bell/routes.json
+cp ~/hines/setup/mcp-servers/claude-peers-mcp/launchd/com.hines.peers-bell.plist ~/Library/LaunchAgents/com.hines.peers-bell.plist
+launchctl bootstrap gui/"$(id -u)" ~/Library/LaunchAgents/com.hines.peers-bell.plist
+TOKEN=$(~/.local/bin/opa read --no-newline "op://Agents/claude-docs-integrations-keys.env/CLAUDE_PEERS_TOKEN")
+curl -sf -H "Authorization: Bearer $TOKEN" http://100.103.170.84:8812/health
+```
+
+A wake is a send to `mac-shaw-plumbing-no-tty` from a registered seat. The reply must include `wake: sent`, and the bell log must contain `woke mac-shaw-plumbing-no-tty`. The mail text must not be in that log line.
+
+After that wake has happened:
+
+```sh
+systemctl --user disable --now claude-peers-lead-wake.service
+```
 
 ## Rollback
 

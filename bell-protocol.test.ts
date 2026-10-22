@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
+import { deliverWake, wakeFailure, wakeSeat, type WakeOutcome } from "./bell.ts";
 import { dispatchTimedOut, runStatus, T3_HTTP_TIMEOUT_MS } from "./bell-dispatch.ts";
 import { formatSendResult, SEND_DEADLINE_MS } from "./shared/message-contract.ts";
 import {
   WAKE_TEXT,
   bellPeerId,
+  keepWake,
   loadBells,
   loadRouteTable,
   mergeRuntime,
@@ -165,6 +167,52 @@ test("wakeCommandId is stable for a message id", () => {
   expect(wakeCommandId(42)).toBe(wakeCommandId(42));
   expect(wakeCommandId(42)).not.toBe(wakeCommandId(43));
   expect(wakeCommandId(42)[14]).toBe("5");
+});
+
+test("a no-route is not cached, so a corrected routes file wakes on retry", async () => {
+  const thread = "mcp:36a41ff7-8eef-49ab-a947-55027c14f468";
+  const memory = new Map<string, { at: number; result: Promise<WakeOutcome> }>();
+  let routes: Record<string, { threadId: string }> = {};
+  let calls = 0;
+  const deliver = (body: any, commandId: string | null) => deliverWake({
+    body,
+    commandId,
+    overrides: routes,
+    threads: [{ id: thread, worktreePath: null, archivedAt: null, latestTurnState: null }],
+    shellFailed: false,
+    authOk: true,
+    ring: async () => {},
+    dispatch: async () => {
+      calls += 1;
+      return { dispatchMode: "start_immediately" };
+    },
+  });
+  const body = {
+    to_id: "mac-shaw-plumbing-no-tty",
+    cwd: "/Users/wesleyhines/hines/shaw",
+    runtime: "codex",
+    message_id: 7,
+  };
+  const first = await wakeSeat(memory, body, deliver);
+  expect(first).toEqual({ ok: false, error: "no-route" });
+  expect(calls).toBe(0);
+  routes = { "mac-shaw-plumbing-no-tty": { threadId: thread } };
+  const second = await wakeSeat(memory, body, deliver);
+  expect(second.ok).toBe(true);
+  expect(second.threadId).toBe(thread);
+  expect(calls).toBe(1);
+  const third = await wakeSeat(memory, body, deliver);
+  expect(third.ok).toBe(true);
+  expect(calls).toBe(1);
+});
+
+test("a timeout after the command is sent is kept, and an earlier failure is not", () => {
+  expect(keepWake({ ok: true })).toBe(true);
+  expect(keepWake(wakeFailure(new Error("RPC orchestration.dispatchCommand timed out")))).toBe(true);
+  expect(keepWake(wakeFailure(new Error("WebSocket open timed out")))).toBe(false);
+  expect(keepWake(wakeFailure(new Error("HTTP 500 at /api/auth/websocket-ticket")))).toBe(false);
+  expect(keepWake({ ok: false, error: "no-route" })).toBe(false);
+  expect(keepWake({ ok: false, error: "credential-unavailable" })).toBe(false);
 });
 
 test("one message shares one wake outcome", async () => {

@@ -216,19 +216,30 @@ export function wakeCommandId(messageId: number): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+export function keepWake(result: { ok?: boolean; uncertain?: boolean }): boolean {
+  return result.ok === true || result.uncertain === true;
+}
+
 export function shareWake<T>(
   memory: Map<string, { at: number; result: Promise<T> }>,
   key: string,
   now: number,
   ttlMs: number,
   run: () => Promise<T>,
+  retain: (result: T) => boolean = () => true,
 ): Promise<T> {
   for (const [id, item] of memory) {
     if (now - item.at > ttlMs) memory.delete(id);
   }
   const cached = memory.get(key);
   if (cached && now - cached.at <= ttlMs) return cached.result;
-  const result = run();
+  const result = run().then((value) => {
+    if (!retain(value)) memory.delete(key);
+    return value;
+  }, (error) => {
+    memory.delete(key);
+    throw error;
+  });
   memory.set(key, { at: now, result });
   return result;
 }

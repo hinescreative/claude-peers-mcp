@@ -5,7 +5,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { bellPeerId, loadRouteTable, pidAlive, planWake, shareWake, wakeCommandId, type RouteOverride } from "./bell-protocol.ts";
+import { bellPeerId, keepWake, loadRouteTable, pidAlive, planWake, shareWake, wakeCommandId, type RouteOverride } from "./bell-protocol.ts";
 import { dispatchToThread, readShell, type T3Auth } from "./bell-dispatch.ts";
 
 const PEER_ID_RE = /^[a-zA-Z0-9_-]{3,64}$/;
@@ -30,6 +30,74 @@ export function loadT3Auth(path: string): T3Auth {
   const auth = JSON.parse(readFileSync(path, "utf8"));
   if (!auth.baseUrl || !auth.token) throw new Error("T3 credential file is incomplete");
   return { baseUrl: auth.baseUrl, token: auth.token, environmentId: auth.environmentId };
+}
+
+export type WakeOutcome = {
+  ok: boolean;
+  error?: string;
+  uncertain?: boolean;
+  to_id?: string;
+  threadId?: string;
+  dispatchMode?: string;
+  tmux?: string;
+};
+
+export function wakeFailure(error: unknown): WakeOutcome {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const uncertain = /^RPC .+ timed out$/i.test(message);
+  return { ok: false, error: "dispatch-failed", ...(uncertain ? { uncertain: true } : {}) };
+}
+
+export async function deliverWake(input: {
+  body: any;
+  commandId: string | null;
+  overrides: Record<string, RouteOverride>;
+  threads: { id: string; worktreePath: string | null; archivedAt: string | null; latestTurnState: string | null }[] | undefined;
+  shellFailed: boolean;
+  authOk: boolean;
+  dispatch: (threadId: string, text: string, mode: { type: "start_immediately" } | { type: "queue_after_active" }, commandId: string) => Promise<{ dispatchMode: string }>;
+  ring: (target: string, text: string) => Promise<void>;
+}): Promise<WakeOutcome> {
+  const body = input.body;
+  const toId = typeof body?.to_id === "string" ? body.to_id : "";
+  if (!PEER_ID_RE.test(toId)) return { ok: false, error: "no-route" };
+  const planned = planWake({
+    peerId: toId,
+    cwd: typeof body?.cwd === "string" ? body.cwd : null,
+    runtime: typeof body?.runtime === "string" ? body.runtime : null,
+    overrides: input.overrides,
+    threads: input.threads,
+  });
+  if ("error" in planned) {
+    return { ok: false, error: input.shellFailed ? "thread-list-unavailable" : "no-route" };
+  }
+  if ("tmux" in planned) {
+    try {
+      await input.ring(planned.tmux, planned.text);
+      return { ok: true, to_id: toId, tmux: planned.tmux };
+    } catch {
+      return { ok: false, error: "tmux-failed" };
+    }
+  }
+  if (!input.authOk) return { ok: false, error: "credential-unavailable" };
+  if (!input.commandId) return { ok: false, error: "dispatch-failed" };
+  try {
+    const sent = await input.dispatch(planned.threadId, planned.text, planned.dispatchMode, input.commandId);
+    return { ok: true, to_id: toId, threadId: planned.threadId, dispatchMode: sent.dispatchMode };
+  } catch (error) {
+    return wakeFailure(error);
+  }
+}
+
+export function wakeSeat(
+  memory: Map<string, { at: number; result: Promise<WakeOutcome> }>,
+  body: any,
+  deliver: (body: any, commandId: string | null) => Promise<WakeOutcome>,
+): Promise<WakeOutcome> {
+  const messageId = Number.isSafeInteger(body?.message_id) ? Number(body.message_id) : null;
+  const run = () => deliver(body, messageId === null ? null : wakeCommandId(messageId));
+  if (messageId === null) return run();
+  return shareWake(memory, String(messageId), Date.now(), 10 * 60 * 1000, run, keepWake);
 }
 
 async function ringTmux(target: string, text: string) {
@@ -102,54 +170,33 @@ export async function start() {
     }
   }
 
-  const wakeMemory = new Map<string, { at: number; result: Promise<Record<string, unknown>> }>();
+  const wakeMemory = new Map<string, { at: number; result: Promise<WakeOutcome> }>();
 
-  async function wake(body: any) {
-    const messageId = Number.isSafeInteger(body?.message_id) ? Number(body.message_id) : null;
-    const run = () => deliverWake(body, messageId === null ? null : wakeCommandId(messageId));
-    if (messageId === null) return run();
-    return shareWake(wakeMemory, String(messageId), Date.now(), 10 * 60 * 1000, run);
-  }
-
-  async function deliverWake(body: any, commandId: string | null) {
-    const toId = typeof body?.to_id === "string" ? body.to_id : "";
-    if (!PEER_ID_RE.test(toId)) return { ok: false, error: "no-route" };
-    let threads: { id: string; worktreePath: string | null; archivedAt: string | null; latestTurnState: string | null }[] | undefined;
-    let shellFailed = false;
-    try {
-      threads = await readShell(loadT3Auth(t3Path));
-    } catch {
-      shellFailed = true;
-    }
-    const planned = planWake({
-      peerId: toId,
-      cwd: typeof body?.cwd === "string" ? body.cwd : null,
-      runtime: typeof body?.runtime === "string" ? body.runtime : null,
-      overrides: overrides(),
-      threads,
-    });
-    if ("error" in planned) {
-      return { ok: false, error: shellFailed ? "thread-list-unavailable" : "no-route" };
-    }
-    if ("tmux" in planned) {
+  function wake(body: any) {
+    return wakeSeat(wakeMemory, body, async (wakeBody, commandId) => {
+      let threads: { id: string; worktreePath: string | null; archivedAt: string | null; latestTurnState: string | null }[] | undefined;
+      let shellFailed = false;
       try {
-        await ringTmux(planned.tmux, planned.text);
-        log(`rang tmux for ${toId}`);
-        return { ok: true, to_id: toId, tmux: planned.tmux };
+        threads = await readShell(loadT3Auth(t3Path));
       } catch {
-        return { ok: false, error: "tmux-failed" };
+        shellFailed = true;
       }
-    }
-    let auth: T3Auth;
-    try { auth = loadT3Auth(t3Path); } catch { return { ok: false, error: "credential-unavailable" }; }
-    if (!commandId) return { ok: false, error: "dispatch-failed" };
-    try {
-      const sent = await dispatchToThread(auth, planned.threadId, planned.text, planned.dispatchMode, commandId);
-      log(`woke ${toId} ${sent.dispatchMode}`);
-      return { ok: true, to_id: toId, threadId: planned.threadId, dispatchMode: sent.dispatchMode };
-    } catch {
-      return { ok: false, error: "dispatch-failed" };
-    }
+      let authOk = true;
+      let auth: T3Auth | null = null;
+      try { auth = loadT3Auth(t3Path); } catch { authOk = false; }
+      const outcome = await deliverWake({
+        body: wakeBody,
+        commandId,
+        overrides: overrides(),
+        threads,
+        shellFailed,
+        authOk,
+        ring: ringTmux,
+        dispatch: (threadId, text, mode, id) => dispatchToThread(auth as T3Auth, threadId, text, mode, id),
+      });
+      if (outcome.ok) log(outcome.tmux ? `rang tmux for ${outcome.to_id}` : `woke ${outcome.to_id} ${outcome.dispatchMode}`);
+      return outcome;
+    });
   }
 
   async function reapDead() {
