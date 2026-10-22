@@ -108,19 +108,18 @@ export function isWorktreePath(cwd: string | null | undefined): boolean {
   return cwd.replace(/\\/g, "/").includes("/.t3/worktrees/");
 }
 
-export function parentSession(command: string): string | null {
-  const match = /--(?:session-id|resume)(?:=|\s+)(\S+)/.exec(command);
-  return match?.[1] ?? null;
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function validSession(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return SESSION_UUID.test(trimmed) ? trimmed : null;
 }
 
-export function runStarted(
-  beforeOrdinal: number | null,
-  runs: { ordinal?: number; status?: string }[],
-): boolean {
-  if (!runs.length) return false;
-  const latest = [...runs].sort((a, b) => (b.ordinal ?? 0) - (a.ordinal ?? 0))[0];
-  if (!latest || (latest.ordinal ?? 0) <= (beforeOrdinal ?? -1)) return false;
-  return latest.status === "running" || latest.status === "completed";
+// A bare --resume, or --resume --model, is no session. Only a real uuid counts.
+export function parentSession(command: string): string | null {
+  const match = /--(?:session-id|resume)(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(command);
+  return match?.[1] ?? null;
 }
 
 export function bellPeerId(machine: string): string {
@@ -221,11 +220,7 @@ export function nicknameDecision(input: {
     (peer) => peer.id !== input.callerId && peer.nickname.trim().toLowerCase() === key,
   );
   if (reservedOwner) {
-    const exact = input.callerId === reservedOwner;
-    const suffix = input.callerId.startsWith(`${reservedOwner}-`);
-    const baseLive = input.live.some((peer) => peer.id === reservedOwner);
-    // A suffixed respawn may take the name back only after the base seat is gone.
-    if (!exact && !(suffix && !baseLive)) return { ok: false, error: "nickname reserved" };
+    if (input.callerId !== reservedOwner) return { ok: false, error: "nickname reserved" };
     return { ok: true, clearIds: holders.map((peer) => peer.id) };
   }
   if (holders.length) return { ok: false, error: "nickname taken" };

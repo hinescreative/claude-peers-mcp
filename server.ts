@@ -123,12 +123,12 @@ class BrokerFetchError extends Error {
   }
 }
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+async function brokerFetch<T>(path: string, body: unknown, timeoutMs = BROKER_REQUEST_TIMEOUT_MS): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(BROKER_REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -784,7 +784,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await sendPeerMessage(brokerFetch, {
+        const result = await sendPeerMessage((route, payload) => brokerFetch(route, payload, route === "/send-message" ? 10_000 : BROKER_REQUEST_TIMEOUT_MS), {
           from_id: myId,
           to_id,
           text: message,

@@ -139,12 +139,12 @@ function authHeaders(): Record<string, string> {
   return headers;
 }
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+async function brokerFetch<T>(path: string, body: unknown, timeoutMs = 5000): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -480,7 +480,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
 
-      const result = await sendPeerMessage(brokerFetch, {
+      const result = await sendPeerMessage((route, payload) => brokerFetch(route, payload, route === "/send-message" ? 10_000 : 5000), {
         from_id: myId,
         to_id,
         text: message,

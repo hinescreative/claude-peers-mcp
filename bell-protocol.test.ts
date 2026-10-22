@@ -14,8 +14,8 @@ import {
   parentChanged,
   parentSession,
   planDispatch,
+  validSession,
   resolveRoute,
-  runStarted,
   retryDispatch,
   routeIsFresh,
   shouldReaskBase,
@@ -186,21 +186,21 @@ test("only a single live worktree thread matches by path; a project root does no
   });
   expect("threadId" in one && one.threadId).toBe(plain);
   expect(parentSession("claude --resume e58d40fb-1111-4111-8111-111111111111 --model x")).toBe("e58d40fb-1111-4111-8111-111111111111");
-  expect(runStarted(1, [{ ordinal: 2, status: "running" }])).toBe(true);
-  expect(runStarted(2, [{ ordinal: 2, status: "running" }])).toBe(false);
+  expect(parentSession("claude --resume --model grok")).toBe(null);
+  expect(validSession("--model")).toBe(null);
+  expect(validSession("e58d40fb-1111-4111-8111-111111111111")).toBe("e58d40fb-1111-4111-8111-111111111111");
 });
 
-test("a suffixed respawn can reclaim a reserved name only after the base seat is gone", () => {
+test("only the base id may hold a reserved nickname, even after the base is gone", () => {
   const allowlist = loadAllowlist('{"assistant":"mac-assistant-claude-no-tty"}');
-  const live = [{ id: "mac-assistant-claude-no-tty", nickname: "Grok" }];
   expect(nicknameDecision({
     callerId: "mac-assistant-claude-no-tty-ab12",
     nickname: "assistant",
-    live,
+    live: [],
     allowlist,
   }).ok).toBe(false);
   expect(nicknameDecision({
-    callerId: "mac-assistant-claude-no-tty-ab12",
+    callerId: "mac-assistant-claude-no-tty",
     nickname: "assistant",
     live: [],
     allowlist,

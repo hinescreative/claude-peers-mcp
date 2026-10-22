@@ -14,7 +14,13 @@ A running turn is `queue_after_active`. Anything else is `start_immediately`. A 
 
 A cwd match is only for a path under `~/.t3/worktrees/` with exactly one live thread that is not a fork. T3 makes one worktree per thread, so that is unique. A project root, including the Assistant, resolves only by an explicit route.
 
-An unreserved id is first-come: whoever registers while the base is free holds it. A reserved id (the nickname file) is held by the Claude session that last had it. A different session gets a suffix even when the base is free. Moving that seat to a new session is `POST /set-heir` with `base_id` and `session`, or `set_route` for the thread binding. A suffix never reads or writes the base route, and a route is not moved to another machine.
+An unreserved id is first-come: whoever registers while the base is free holds it. A reserved id is granted only to a v2 Claude-harness process whose session is a uuid equal to the recorded heir. No heir recorded means nobody gets the base. A v1 caller or a sessionless caller never gets it. A suffix cannot take the reserved nickname.
+
+When the Assistant moves to a new thread, one call rotates the heir, the route and the old binding:
+
+`curl -s -H "Authorization: Bearer $CLAUDE_PEERS_TOKEN" -H "content-type: application/json" -d '{"base_id":"mac-assistant-claude-no-tty","session":"<session-uuid>","thread_id":"mcp:<uuid>:fork","machine":"mac"}' "$CLAUDE_PEERS_BROKER_URL/set-heir"`
+
+The bearer is the fleet token. Spoofing a session uuid is the same trust as holding that bearer. A suffix never reads or writes the base route, and a route is not moved to another machine.
 
 Nothing sets step 2 today. `server.ts` and `codex-server.ts` will register `claude:t3:<id>` or `codex:t3:<id>` if `CLAUDE_PEERS_THREAD_ID` or `T3_THREAD_ID` is in the environment. T3 does not put either there. The tool that sets it by hand is `set_route` with `thread_id`. No AGENTS.md line calls it, and a seat cannot see its own thread id from the environment, so a startup line would have nothing to pass. Until something records the id, a root-cwd seat is a `routes.json` entry.
 

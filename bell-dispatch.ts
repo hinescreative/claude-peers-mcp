@@ -1,6 +1,6 @@
 // Starts an idle T3 thread, or queues behind a turn that is already running.
 // Same dispatch lead-wake uses. Never steers and never restarts a live run.
-import { retryDispatch, runStarted } from "./bell-protocol.ts";
+import { retryDispatch } from "./bell-protocol.ts";
 
 export function runStatus(snapshot: any): string | null {
   const thread = snapshot?.thread ?? snapshot?.projection ?? snapshot;
@@ -147,25 +147,7 @@ export async function dispatchToThread(
   const rpc = await connect(auth);
   try {
     try {
-      const beforeSnap = await http(auth, `/api/orchestration/threads/${encodeURIComponent(threadId)}`).catch(() => null);
-      const beforeRuns = beforeSnap?.projection?.runs ?? beforeSnap?.thread?.runs ?? [];
-      const beforeOrdinal = Array.isArray(beforeRuns) && beforeRuns.length
-        ? Math.max(...beforeRuns.map((run: { ordinal?: number }) => run?.ordinal ?? 0))
-        : null;
-      const accepted = await dispatch(rpc, threadId, text, dispatchMode, commandId);
-      const confirmMs = Number(process.env.BELL_RUN_CONFIRM_MS ?? "60000");
-      if (confirmMs > 0) {
-        const deadline = Date.now() + confirmMs;
-        let started = false;
-        while (Date.now() < deadline) {
-          const snapshot = await http(auth, `/api/orchestration/threads/${encodeURIComponent(threadId)}`);
-          const runs = snapshot?.projection?.runs ?? snapshot?.thread?.runs ?? [];
-          if (runStarted(beforeOrdinal, Array.isArray(runs) ? runs : [])) { started = true; break; }
-          await Bun.sleep(1000);
-        }
-        if (!started) throw new Error("no run started");
-      }
-      return accepted;
+      return await dispatch(rpc, threadId, text, dispatchMode, commandId);
     } catch (error) {
       if (dispatchTimedOut(error)) throw error;
       let turn: string | null = null;

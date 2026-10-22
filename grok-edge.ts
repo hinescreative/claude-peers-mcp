@@ -235,7 +235,7 @@ const LEAD_WAKE_URL = process.env.LEAD_WAKE_URL ?? "http://100.108.57.10:8811/wa
 
 export function shouldWakeLead(result: { ok?: boolean; error?: string; wake?: string } | null | undefined): boolean {
   if (!result) return false;
-  if (result.wake === "no-route" || result.wake === "unconfigured") return true;
+  if (result.wake === "no-route" || result.wake === "unconfigured" || result.error === "no-route") return true;
   if (result.ok) return false;
   const text = String(result.error ?? "");
   return text === "peer not found or stale"
