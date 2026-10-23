@@ -40,9 +40,10 @@ import {
 } from "./shared/summarize.ts";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { resolvePin } from "./shared/pins.ts";
 
 // --- Configuration ---
 
@@ -267,22 +268,6 @@ function stablePeerId(machine: string, cwd: string, tty: string | null): string 
   return `${machine}-${cwdBasename(cwd)}-${shortTty(tty)}`
     .replace(/[^a-zA-Z0-9_-]/g, "-")
     .slice(0, 64);
-}
-
-// A session can be pinned to a fixed peer id, so no other session in the same
-// folder can take it after a restart. ~/.claude-peers/pinned-ids.json maps a
-// Claude Code session id (CLAUDE_CODE_SESSION_ID, stable across T3 resumes) to
-// the id, e.g. {"9d62218a-...": "mac-assistant"}. No file or no match: unchanged.
-function pinnedPeerId(): string | undefined {
-  const session = process.env.CLAUDE_CODE_SESSION_ID;
-  if (!session) return undefined;
-  try {
-    const pins = JSON.parse(readFileSync(join(process.env.HOME ?? "", ".claude-peers", "pinned-ids.json"), "utf8"));
-    const id = pins?.[session];
-    return typeof id === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(id) ? id : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function defaultNickname(machine: string, cwd: string, tty: string | null): string {
@@ -1339,8 +1324,20 @@ async function bringUpBroker(): Promise<void> {
     }
   })();
 
+  // A pinned id (and nickname) replaces the stable one before registering.
+  // Resolved here, not in main(), because the T3 lookup may wait a few seconds
+  // and the MCP handshake must not.
+  const pinPromise = process.env.CLAUDE_PEER_ID ? Promise.resolve(undefined) : resolvePin().catch(() => undefined);
+
   // Wait briefly for summary, but don't block bring-up
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+
+  const pin = await pinPromise;
+  if (pin) {
+    myRequestedId = pin.id;
+    if (pin.nickname) myNickname = pin.nickname;
+    log(`Pinned peer id ${pin.id}${pin.nickname ? ` (nickname ${pin.nickname})` : ""} from pin key ${pin.key}`);
+  }
 
   // Auto-mesh-status Layer 1: never register blank. If the LLM summary race
   // produced nothing (failed / keyless / over 3s), register a deterministic
@@ -1397,9 +1394,7 @@ async function main() {
     myNickname = defaultNickname(MACHINE_NAME, myCwd, tty);
     log(`Auto-nickname: ${myNickname}`);
   }
-  const pinned = process.env.CLAUDE_PEER_ID ? undefined : pinnedPeerId();
-  if (pinned) log(`Pinned peer id for this session: ${pinned}`);
-  myRequestedId = process.env.CLAUDE_PEER_ID ?? pinned ?? stablePeerId(MACHINE_NAME, myCwd, tty);
+  myRequestedId = process.env.CLAUDE_PEER_ID ?? stablePeerId(MACHINE_NAME, myCwd, tty);
 
   // Connect MCP over stdio FIRST. The harness handshake must succeed
   // immediately and unconditionally — even if the broker is unreachable —
