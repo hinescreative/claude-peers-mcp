@@ -89,6 +89,7 @@ async function registerSeat(): Promise<void> {
     machine: PEER_MACHINE,
     summary: seatSummary(),
     tier: "infrastructure",
+    runtime: "hosted",
   });
 }
 
@@ -405,7 +406,7 @@ async function callTool(name: string, args: Record<string, unknown> | undefined)
         to_id,
         message_id: sent.message_id,
         duplicate: sent.duplicate,
-        wake: sent.wake ?? "skipped",
+        ...(sent.wake ? { wake: sent.wake } : {}),
         note: formatted.text,
       }),
       formatted.isError,

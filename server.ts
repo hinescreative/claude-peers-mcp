@@ -797,7 +797,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
         const formatted = formatSendResult(to_id, result);
-        return { content: [{ type: "text" as const, text: formatted.text }], isError: formatted.isError };
+        return {
+          content: [{ type: "text" as const, text: formatted.text }],
+          isError: formatted.isError,
+        };
       } catch (e) {
         return {
           content: [

@@ -1,62 +1,42 @@
 # Grok Chat MCP edge
 
-Thin public MCP in front of the live broker. Not a second bus.
+Thin public MCP in front of the broker. Not a second bus.
 
 ```
-Grok Chat Custom connector
-  → Cloudflare Tunnel → 127.0.0.1:8787/mcp
-  → Tailscale → 100.108.57.10:7899
+Grok Chat custom connector
+  → your tunnel → 127.0.0.1:8787/mcp
+  → CLAUDE_PEERS_BROKER_URL
 ```
 
 ## Tools
 
 - `list_peers`
-- `send_message` (`to_id`, `message`) — `from_id` pinned to `grok-chat`
-- `check_messages` — poll the `grok-chat` queue
+- `send_message` (`to_id`, `message`) — `from_id` pinned to the edge's peer id
+- `check_messages` — poll that peer's queue
 
 No `set_summary`, `register`, `unregister`, `set_state`, jobs, infer, FS, CRM.
 
-## Run on theoldone / iMac (same host as broker or any tailnet node that can hit it)
+## Run
+
+On the broker host, or any host that can reach it. Set `CLAUDE_PEERS_BROKER_URL`, `CLAUDE_PEERS_TOKEN`, and `GROK_MCP_TOKEN`. Do not print the tokens.
 
 ```sh
-cd ~/mcp-servers/claude-peers-mcp
-
-GROK_MCP_TOKEN="$(openssl rand -hex 24)" \
-CLAUDE_PEERS_TOKEN="$CLAUDE_PEERS_TOKEN" \
-CLAUDE_PEERS_BROKER_URL=http://100.108.57.10:7899 \
-GROK_PEER_ID=grok-chat \
-GROK_EDGE_HOST=127.0.0.1 \
-GROK_EDGE_PORT=8787 \
-bun grok-edge.ts
+cd /path/to/claude-peers-mcp
+GROK_EDGE_HOST=127.0.0.1 GROK_EDGE_PORT=8787 bun grok-edge.ts
 ```
 
-Optional allowlist:
+Optional allowlist of peer ids: `GROK_PEER_ALLOWLIST=peer-a,peer-b`.
 
-```sh
-GROK_PEER_ALLOWLIST=pc-nagatha-session-no-tty,pc-hal-no-tty,tony,clarvis,pc-grok-session-no-tty
-```
+## Tunnel
 
-## Cloudflare
+Point a hostname you control at `http://127.0.0.1:8787`. Do not point it at the broker port.
 
-Reuse the existing tunnel habit. New hostname, new origin. Do not point it at :7899.
+The connector URL is `https://your-host/mcp` with bearer `GROK_MCP_TOKEN`. Do not put `CLAUDE_PEERS_TOKEN` in the connector.
 
-```text
-mcp.hinescreative.xyz  →  http://127.0.0.1:8787
-```
-
-Grok Chat → Connectors → Custom:
-
-```text
-URL:  https://mcp.hinescreative.xyz/mcp
-Auth: Bearer GROK_MCP_TOKEN
-```
-
-Do not put `CLAUDE_PEERS_TOKEN` in the Grok connector. That token stays on the tailnet.
-
-Cloudflare Access in front will likely break Grok's connector handshake. Use the edge bearer first.
+An identity-aware proxy in front will likely break the connector handshake. Use the edge bearer first.
 
 ## Seat
 
-On boot the edge registers `grok-chat` and heartbeats every 15s so replies have a mailbox. If the edge dies, the broker TTL (20 min) drops the seat and undelivered mail.
+On boot the edge registers its peer id and heartbeats every 15s so replies have a mailbox. If the edge dies, the broker TTL (20 min) drops the seat and undelivered mail.
 
-Peers reply to `grok-chat`, not to a nickname.
+Peers reply to the peer id, not to a nickname.

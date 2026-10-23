@@ -41,7 +41,7 @@ Each route reproduces the bun broker's exact success/error shape and side effect
 
 ### §3a `/set-state` (live bun parity)
 
-Source of truth: theoldone `/home/hinescreative/mcp-servers/claude-peers-mcp/broker.ts` `handleSetState` (dirty local on `c7adea0`; matches GitHub `main`).
+Source of truth: `broker.ts` `handleSetState` in this repo.
 
 - Request: `{ "id": string, "blocked_on"?: string|null, "blocked_since"?: string|null }`
 - `blocked_on` normalized: null/undefined→null; non-string→null; trim + max 128; empty→null.
@@ -81,7 +81,7 @@ Bun may still PID-reap; CF intentionally does not. Do not “fix” CF to match 
 
 - Broker base URL knob: **`CLAUDE_PEERS_BROKER_URL`** (not bare `BROKER_URL`).
 - Shared broker token: `CLAUDE_PEERS_TOKEN`.
-- GB public MCP face stays `https://mcp.hinescreative.xyz/mcp` on cutover; only the edge→broker URL flips when Architect greenlights.
+- A public MCP face is whatever hostname you put in front of the edge. Only the edge's `CLAUDE_PEERS_BROKER_URL` changes when the broker moves.
 
 ## §9 Non-goals / out of scope (this CONTRACT)
 

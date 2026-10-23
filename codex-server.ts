@@ -494,7 +494,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       const formatted = formatSendResult(to_id, result);
-      return { content: [{ type: "text" as const, text: formatted.text }], isError: formatted.isError };
+      return {
+        content: [{ type: "text" as const, text: formatted.text }],
+        isError: formatted.isError,
+      };
     }
 
     case "set_route": {
@@ -661,7 +664,9 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-main().catch((e) => {
-  log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((e) => {
+    log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  });
+}

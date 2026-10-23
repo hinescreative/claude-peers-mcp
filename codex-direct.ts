@@ -105,6 +105,7 @@ async function register(summary: string): Promise<string> {
     tty: null,
     machine,
     summary,
+    runtime: "poll",
   });
   return result.id;
 }
@@ -176,9 +177,10 @@ if (cmd === "status") {
       to_id: toId,
       text: message,
     });
+    if (!result.ok) throw new Error(result.error ?? "send failed");
     const formatted = formatSendResult(toId, result);
-    if (!result.ok || formatted.isError) throw new Error(result.ok ? formatted.text : (result.error ?? "send failed"));
     console.log(formatted.text);
+    if (formatted.isError) process.exitCode = 1;
   } finally {
     if (!fromId) await unregister(id);
   }
@@ -194,14 +196,17 @@ if (cmd === "status") {
   const id = await register("codex-direct fallback: temporary Codex peer polling for ack/result.");
   const beat = setInterval(() => heartbeat(id), 10_000);
   try {
-    await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+    const sent = await brokerFetch<{ ok: boolean; error?: string; wake?: string }>("/send-message", {
       from_id: id,
       to_id: toId,
       text: message,
-    }).then((result) => {
-      if (!result.ok) throw new Error(result.error ?? "send failed");
     });
-    console.log(`sent from ${id} to ${toId}; polling ${seconds}s`);
+    if (!sent.ok) throw new Error(sent.error ?? "send failed");
+    console.log(`sent from ${id} to ${toId}${sent.wake ? `\nwake: ${sent.wake}` : ""}`);
+    if (sent.wake === "no-route" || sent.wake === "failed") {
+      process.exitCode = 1;
+    } else {
+    console.log(`polling ${seconds}s`);
 
     const deadline = Date.now() + seconds * 1000;
     while (Date.now() < deadline) {
@@ -215,6 +220,7 @@ if (cmd === "status") {
         break;
       }
       await Bun.sleep(2000);
+    }
     }
   } finally {
     clearInterval(beat);

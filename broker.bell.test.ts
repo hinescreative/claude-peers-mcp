@@ -92,7 +92,7 @@ test("a live claude seat is not forwarded, and the mail stays", async () => {
   const before = wakes.length;
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "mac-claude", text: "SECRET-MAIL hello" });
   expect(sent.json.ok).toBe(true);
-  expect(sent.json.wake).toBe("skipped");
+  expect(sent.json.wake).toBeUndefined();
   expect(wakes.length).toBe(before);
   const polled = await post("/poll-messages", { id: "mac-claude" });
   expect(polled.json.messages.map((m: { text: string }) => m.text)).toEqual(["SECRET-MAIL hello"]);

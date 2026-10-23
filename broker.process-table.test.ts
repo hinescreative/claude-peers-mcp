@@ -118,7 +118,7 @@ test("new register persists parent runtime rings", async () => {
   expect(row?.rings).toEqual([1, 2, 3]);
 });
 
-test("re-register without new fields keeps parent runtime rings", async () => {
+test("re-register without new fields keeps parent and rings, and does not keep runtime", async () => {
   const reg = await post("/register", {
     requested_id: "test-new-client",
     pid: 4243,
@@ -134,7 +134,7 @@ test("re-register without new fields keeps parent runtime rings", async () => {
     (p) => p.id === "test-new-client",
   );
   expect(row?.parent_id).toBe("test-old-client");
-  expect(row?.runtime).toBe("grok-build");
+  expect(row?.runtime ?? null).toBeNull();
   expect(row?.rings).toEqual([1, 2, 3]);
 });
 

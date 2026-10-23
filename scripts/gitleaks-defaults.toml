@@ -1,0 +1,6 @@
+# Default secret rules only. Fleet rules stay in .gitleaks.toml.
+# scripts/precommit-gitleaks.sh passes this file with --config.
+title = "gitleaks defaults"
+
+[extend]
+useDefault = true

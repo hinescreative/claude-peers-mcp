@@ -104,7 +104,7 @@ export async function start() {
     const r = await broker("/register", {
       ...credentials(), requested_id: PEER_ID, payload_version: 2, nickname: "Butler inbox",
       pid: process.pid, cwd: process.cwd(), git_root: null, tty: null, machine: "theoldone",
-      tier: "infrastructure", summary: SUMMARY,
+      tier: "infrastructure", summary: SUMMARY, runtime: "hosted",
     });
     if (r.id !== PEER_ID || r.role !== "owner" || !r.lease_id) throw new Error("broker did not grant the butler-inbox lease");
     lease = r.lease_id;

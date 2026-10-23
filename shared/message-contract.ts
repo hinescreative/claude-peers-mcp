@@ -23,10 +23,10 @@ export async function sendPeerMessage(
   return call("/send-message", { ...body, ...metadata });
 }
 
-export function formatSendResult(toId: string, result: SendMessageResponse & { wake?: string }): { text: string; isError: boolean } {
-  const wake = result.wake ?? "skipped";
+export function formatSendResult(toId: string, result: { ok?: boolean; message_id?: number; wake?: string }): { text: string; isError: boolean } {
+  const line = `Message sent to peer ${toId}. Message ID: ${result.message_id ?? "unavailable"}.`;
   return {
-    text: `Message sent to peer ${toId}. Message ID: ${result.message_id ?? "unavailable"}.\nwake: ${wake}`,
-    isError: wake === "no-route" || wake === "failed",
+    text: result.wake ? `${line}\nwake: ${result.wake}` : line,
+    isError: result.wake === "no-route" || result.wake === "failed",
   };
 }
