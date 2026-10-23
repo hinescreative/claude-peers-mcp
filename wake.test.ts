@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { loadRoutes, matchWorktree, planWake, wakeCommandId, WAKE_TEXT } from "./protocol.mjs";
+import { isNoPush, parentChanged } from "./bell-protocol.ts";
 
 const THREAD = "mcp:36a41ff7-8eef-49ab-a947-55027c14f468";
 const WORKTREE = "/Users/wesleyhines/.t3/worktrees/bell-proof/codex";
@@ -45,15 +46,12 @@ test("a worktree match is one live non-fork thread, and a route file wins", () =
 });
 
 test("the parent-death predicate notices a new parent and ignores pid 1", () => {
-  const died = (startPid: number, currentPid: number) => {
-    if (!startPid || startPid === 1) return false;
-    return Number.isInteger(currentPid) && currentPid !== startPid;
-  };
+  const died = parentChanged;
   expect(died(10, 11)).toBe(true);
   expect(died(10, 10)).toBe(false);
   expect(died(1, 50)).toBe(false);
   const source = readFileSync(new URL("./codex-server.ts", import.meta.url), "utf8");
-  expect(source).toContain("return Number.isInteger(currentParent) && currentParent !== START_PARENT_PID;");
+  expect(source).toContain("return parentChanged(START_PARENT_PID, currentParent);");
 });
 
 test("an explicit route may name the Assistant fork", () => {
@@ -357,7 +355,7 @@ async function mcpRegister(script: string, env: Record<string, string>) {
   return { child, pump };
 }
 
-test("codex-server registers runtime poll", async () => {
+test("codex-server registers a runtime with no push channel", async () => {
   const { child } = await mcpRegister("codex-server.ts", { CODEX_PEER_ID: "real-codex" });
   try {
     let runtime = "";
@@ -367,7 +365,8 @@ test("codex-server registers runtime poll", async () => {
       if (runtime) break;
       await Bun.sleep(50);
     }
-    expect(runtime).toBe("poll");
+    expect(runtime).toBe("codex");
+    expect(isNoPush(runtime)).toBe(true);
   } finally {
     child.kill();
   }
@@ -577,3 +576,59 @@ test("a request to lead-wake comes back as a reply the sender can read", async (
     child.kill();
   }
 }, 15_000);
+
+test("a machine with a bell is woken by its bell; anything else still goes to lead-wake", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const bellHits: any[] = [];
+  const bell = Bun.serve({
+    port: 0,
+    fetch: async (req) => {
+      bellHits.push(await req.json());
+      return Response.json({ ok: true, threadId: THREAD, dispatchMode: "start_immediately" });
+    },
+  });
+  const bellsFile = `/tmp/claude-peers-wake-bells-${process.pid}.json`;
+  writeFileSync(bellsFile, JSON.stringify({ bells: { belled: `http://127.0.0.1:${bell.port}` } }));
+  const bare = Bun.serve({ port: 0, fetch() { return new Response(""); } });
+  const port = bare.port;
+  bare.stop(true);
+  const child = Bun.spawn(["bun", "broker.ts"], {
+    cwd: import.meta.dir,
+    env: {
+      ...process.env,
+      CLAUDE_PEERS_PORT: String(port),
+      CLAUDE_PEERS_DB: `/tmp/claude-peers-wake-both-${process.pid}.db`,
+      CLAUDE_PEERS_TOKEN: "test-token",
+      CLAUDE_PEERS_TOKENS: "",
+      CLAUDE_PEERS_TOKENS_FILE: "",
+      CLAUDE_PEERS_BELLS: bellsFile,
+      LEAD_WAKE_URL: `http://127.0.0.1:${EDGE_PORT}/wake`,
+      CLAUDE_CODE_MESSAGING_SOCKET: "",
+    },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const call = async (path: string, body: Record<string, unknown>) => (await fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
+    body: JSON.stringify(body),
+  })).json() as Promise<any>;
+  try {
+    await waitHealth(`http://127.0.0.1:${port}/health`);
+    await call("/register", seat("both-sender"));
+    await call("/register", seat("belled-codex", { machine: "belled", runtime: "codex" }));
+    await call("/register", seat("plain-codex", { machine: "plain", runtime: "codex" }));
+    const edgeBefore = wakes.length;
+    const viaBell = await call("/send-message", { from_id: "both-sender", to_id: "belled-codex", text: "a" });
+    expect(viaBell.wake).toBe("sent");
+    expect(bellHits.at(-1)?.to_id).toBe("belled-codex");
+    expect(wakes.length).toBe(edgeBefore);
+    const viaEdge = await call("/send-message", { from_id: "both-sender", to_id: "plain-codex", text: "b" });
+    expect(viaEdge.wake).toBe("sent");
+    expect(wakes.at(-1)?.to_id).toBe("plain-codex");
+    expect(bellHits.length).toBe(1);
+  } finally {
+    child.kill();
+    bell.stop(true);
+  }
+});
