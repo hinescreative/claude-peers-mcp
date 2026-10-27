@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // Hosted inbox for the Links seat. Mailbox, broker ack, and doorbell are the butler-inbox ones.
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { Mailbox, ringDoorbell } from "./butler-inbox-edge";
 
@@ -10,6 +10,48 @@ export { Mailbox, ringDoorbell };
 
 const stamp = () => new Date().toLocaleString("en-US", { timeZone: "America/Chicago", hour12: true });
 const log = (s: string) => console.log(`[${stamp()}] [links-inbox] ${s}`);
+const BELL_EVERY = 300_000;
+const PATH_HOOK = /^\/api\/hooks\/[A-Za-z0-9_.%-]+\/[A-Za-z0-9_.%-]+$/;
+const RELAY_HOOK = /^https:\/\/relay\.t3\.codes\/v1\/hooks\/[A-Za-z0-9_.%:-]+(?:\/[A-Za-z0-9_.%:-]+)+$/;
+
+// Path hooks reuse the Butler ringer. Absolute relay hooks are the current T3 webhook shape.
+export async function ringLinksDoorbell(mail: Mailbox, state: string, now = Date.now(), post = fetch, report = log) {
+  if (!mail.unread().length) return;
+  if (now - Number(mail.get("bell.last_attempt") ?? 0) < BELL_EVERY) return;
+  const file = join(state, "doorbell");
+  let hook: string;
+  try {
+    if (statSync(file).mode & 0o077) throw new Error("unsafe permissions");
+    hook = readFileSync(file, "utf8").trim();
+  } catch (e: any) {
+    if (now - Number(mail.get("bell.last_missing") ?? 0) >= BELL_EVERY) {
+      report(e.code === "ENOENT" ? "no doorbell path" : "doorbell file unavailable or not mode 600");
+      mail.set("bell.last_missing", String(now));
+    }
+    return;
+  }
+  if (PATH_HOOK.test(hook)) return ringDoorbell(mail, state, now, post, report);
+  if (!RELAY_HOOK.test(hook)) {
+    if (now - Number(mail.get("bell.last_missing") ?? 0) >= BELL_EVERY) {
+      report("invalid doorbell target");
+      mail.set("bell.last_missing", String(now));
+    }
+    return;
+  }
+  mail.set("bell.last_attempt", String(now));
+  try {
+    const res = await post(hook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"doorbell":true}',
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    });
+    report(res.ok ? `doorbell rang (${res.status})` : `doorbell failed (HTTP ${res.status})`);
+  } catch {
+    report("doorbell failed (network/timeout)");
+  }
+}
 
 export function requireEnv(name: string): string {
   const value = process.env[name];
@@ -83,7 +125,7 @@ export async function start() {
       } catch { await register(); }
       await collect();
     } catch (e: any) { log(e.message?.startsWith("broker ") ? e.message : "broker cycle failed"); }
-    await ringDoorbell(mail, state);
+    await ringLinksDoorbell(mail, state);
   }
   await register();
   const tools = [
