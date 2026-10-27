@@ -1,0 +1,19 @@
+[Unit]
+Description=claude-peers permanent Links inbox edge
+After=network-online.target claude-peers-broker.service
+Wants=network-online.target
+Requires=claude-peers-broker.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/mcp-servers/claude-peers-mcp
+EnvironmentFile=%h/.local/state/links-inbox/edge.env
+ExecStart=%h/.bun/bin/bun %h/mcp-servers/claude-peers-mcp/links-inbox-edge.ts
+Restart=always
+RestartSec=3
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
