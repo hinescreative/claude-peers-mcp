@@ -22,6 +22,8 @@ let bellHold: Promise<void> | null = null;
 const bell = Bun.serve({
   port: BELL_PORT,
   fetch: async (req) => {
+    // Something on a dev machine may GET / a fresh port; only the broker's POST counts.
+    if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
     const body = await req.json() as { command_id?: string; message_id?: number };
     wakes.push({ body, auth: req.headers.get("Authorization"), command_id: body.command_id });
     if (bellHold) await bellHold;

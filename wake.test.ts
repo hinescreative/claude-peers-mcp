@@ -74,6 +74,8 @@ let edgeMode: "ok" | "no-route" | "hold" = "ok";
 const edge = Bun.serve({
   port: EDGE_PORT,
   fetch: async (req) => {
+    // Something on a dev machine may GET / a fresh port; only the broker's POST counts.
+    if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
     const body = await req.json();
     wakes.push(body);
     wakeAuth.push(req.headers.get("Authorization"));
@@ -583,6 +585,7 @@ test("a machine with a bell is woken by its bell; anything else still goes to le
   const bell = Bun.serve({
     port: 0,
     fetch: async (req) => {
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
       bellHits.push(await req.json());
       return Response.json({ ok: true, threadId: THREAD, dispatchMode: "start_immediately" });
     },
