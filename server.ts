@@ -245,10 +245,29 @@ function getTty(): string | null {
 
 function parentProcessChanged(): boolean {
   if (!START_PARENT_PID || START_PARENT_PID === 1) return false;
+  if (process.platform === "win32") {
+    // Windows never reparents an orphan, so "changed" means "the parent is gone".
+    // Git for Windows ships a ps.exe without -o: once Git was on the seats' PATH
+    // (card 665, 2026-11-03) the ps call below returned "" and read as changed,
+    // which made every PC seat's server exit before it registered. Ask tasklist
+    // by its full path instead, so PATH cannot change the answer.
+    try {
+      const systemRoot = process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows";
+      const proc = Bun.spawnSync([`${systemRoot}\\System32\\tasklist.exe`, "/FI", `PID eq ${START_PARENT_PID}`, "/NH", "/FO", "CSV"]);
+      if (!proc.success) return false; // unknown, not changed
+      const out = new TextDecoder().decode(proc.stdout);
+      // CSV columns: Image Name, PID, Session Name, Session#, Mem Usage. Match the PID column only.
+      return !new RegExp(`^"[^"]*","${START_PARENT_PID}",`, "m").test(out);
+    } catch {
+      return false;
+    }
+  }
   try {
     const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
-    const currentParent = Number(new TextDecoder().decode(proc.stdout).trim());
-    return Number.isInteger(currentParent) && currentParent !== START_PARENT_PID;
+    const out = new TextDecoder().decode(proc.stdout).trim();
+    if (!proc.success || out === "") return false; // unknown, not changed
+    const currentParent = Number(out);
+    return Number.isInteger(currentParent) && currentParent > 0 && currentParent !== START_PARENT_PID;
   } catch {
     return false;
   }
@@ -1207,7 +1226,7 @@ function applyRegistration(registration: RegisterResponse): void {
 async function registerUntilActive(summary: string): Promise<void> {
   for (let attempt = 1; !shuttingDown; attempt++) {
     if (parentProcessChanged()) {
-      log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned MCP server before registration`);
+      log(`Parent process ${START_PARENT_PID} is gone or changed; exiting orphaned MCP server before registration`);
       await cleanupAndExit();
       return;
     }
@@ -1223,7 +1242,7 @@ async function registerUntilActive(summary: string): Promise<void> {
       if (myRole === "standby") {
         log(`Peer ${myId} is on standby; retrying registration in ${REGISTER_RETRY_MS}ms`);
         if (parentProcessChanged()) {
-          log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned standby MCP server`);
+          log(`Parent process ${START_PARENT_PID} is gone or changed; exiting orphaned standby MCP server`);
           await cleanupAndExit();
           return;
         }
@@ -1239,7 +1258,7 @@ async function registerUntilActive(summary: string): Promise<void> {
       myLeaseExpiresAt = null;
       log(`Broker bring-up attempt ${attempt} failed (retrying in ${REGISTER_RETRY_MS}ms): ${e instanceof Error ? e.message : String(e)}`);
       if (parentProcessChanged()) {
-        log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned MCP server`);
+        log(`Parent process ${START_PARENT_PID} is gone or changed; exiting orphaned MCP server`);
         await cleanupAndExit();
         return;
       }
@@ -1262,7 +1281,7 @@ async function heartbeatLoop(): Promise<void> {
     if (shuttingDown || !myId || !canMutateBroker()) continue;
 
     if (parentProcessChanged()) {
-      log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned MCP server`);
+      log(`Parent process ${START_PARENT_PID} is gone or changed; exiting orphaned MCP server`);
       await cleanupAndExit();
       return;
     }
