@@ -24,6 +24,7 @@ import type {
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
 import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { THREAD_ID, parentChanged } from "./bell-protocol.ts";
 
 type ClaudePeersEnv = {
   CLAUDE_PEERS_BROKER_URL?: string;
@@ -71,6 +72,24 @@ let myContextUsed = parseOptionalInt(process.env.CODEX_PEER_CONTEXT_USED ?? proc
 let myContextNote = process.env.CODEX_PEER_CONTEXT_NOTE ?? process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
+const START_PARENT_PID = process.ppid;
+let myBoundThread: string | null = null;
+
+function registeredRuntime(): string {
+  const fromEnv = (process.env.CLAUDE_PEERS_THREAD_ID ?? process.env.T3_THREAD_ID ?? "").trim();
+  const thread = THREAD_ID.test(fromEnv) ? fromEnv : myBoundThread;
+  return thread ? `codex:t3:${thread}` : "codex";
+}
+
+function parentProcessChanged(): boolean {
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
+    const currentParent = Number(new TextDecoder().decode(proc.stdout).trim());
+    return parentChanged(START_PARENT_PID, currentParent);
+  } catch {
+    return false;
+  }
+}
 
 const isLocalBroker = BROKER_URL.includes("127.0.0.1") || BROKER_URL.includes("localhost");
 
@@ -118,19 +137,6 @@ function authHeaders(): Record<string, string> {
     headers.Authorization = `Bearer ${AUTH_TOKEN}`;
   }
   return headers;
-}
-
-const START_PARENT_PID = process.ppid;
-
-function parentProcessChanged(): boolean {
-  if (!START_PARENT_PID || START_PARENT_PID === 1) return false;
-  try {
-    const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
-    const currentParent = Number(new TextDecoder().decode(proc.stdout).trim());
-    return Number.isInteger(currentParent) && currentParent !== START_PARENT_PID;
-  } catch {
-    return false;
-  }
 }
 
 async function brokerFetch<T>(path: string, body: unknown, timeoutMs = 5000): Promise<T> {
@@ -242,7 +248,7 @@ async function registerPeer(): Promise<void> {
     tty: myTty,
     machine: MACHINE_NAME,
     summary: mySummary,
-    runtime: "poll",
+    runtime: registeredRuntime(),
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
@@ -354,6 +360,17 @@ const TOOLS = [
         },
       },
       required: ["nickname"],
+    },
+  },
+  {
+    name: "set_route",
+    description: "Register this Codex seat's T3 thread id so the peers bell can wake it.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        thread_id: { type: "string" as const, description: "T3 thread id, with or without the mcp: prefix." },
+      },
+      required: ["thread_id"],
     },
   },
   {
@@ -483,6 +500,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    case "set_route": {
+      const threadId = String((args as { thread_id?: string }).thread_id ?? "").trim();
+      if (!THREAD_ID.test(threadId)) {
+        return { content: [{ type: "text" as const, text: "thread_id must be a T3 thread id" }], isError: true };
+      }
+      await ensureRegistered();
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet." }], isError: true };
+      myBoundThread = threadId;
+      await brokerFetch("/set-runtime", { id: myId, runtime: registeredRuntime() });
+      return { content: [{ type: "text" as const, text: "Route registered. A peers message can wake this thread." }] };
+    }
+
     case "set_nickname": {
       const { nickname } = args as { nickname: string };
       myNickname = nickname.trim().slice(0, 64);
@@ -610,7 +639,9 @@ async function main() {
   const heartbeatTimer = setInterval(async () => {
     try {
       if (parentProcessChanged()) {
-        log(`Parent process changed from ${START_PARENT_PID}; exiting orphaned MCP server`);
+        log(`Parent process changed from ${START_PARENT_PID}; exiting orphaned Codex peer`);
+        clearInterval(heartbeatTimer);
+        try { if (myId) await brokerFetch("/unregister", { id: myId }); } catch { /* row expires on its own */ }
         process.exit(0);
       }
       await ensureRegistered();

@@ -6,7 +6,9 @@ A send is stored, then the broker may ask the lead-wake edge. The edge is `lead-
 
 The broker calls `POST $LEAD_WAKE_URL` with `to_id`, `from_id`, `kind`, `message_id`, `cwd`, and `machine`. The bearer is `CLAUDE_PEERS_TOKEN`, or the first line of `CLAUDE_PEERS_TOKENS_FILE` when that variable is unset. The wait is 3 seconds.
 
-It calls when the recipient has no row, the row is stale, or the row's runtime is `poll`. A live seat with any other runtime is not forwarded. An id that is not `[a-zA-Z0-9_-]{3,64}` is stored as `wake: no-route` and the edge is not called. If `LEAD_WAKE_URL` is unset the wake is `unconfigured` and the edge is not called.
+It calls when the recipient has no row, the row is stale, its owner lease is dead, or the row's runtime has no push channel (`poll`, `codex`, `cursor`, `opencode`, `grok`). A live seat with a push channel is not forwarded.
+
+A machine listed in the broker's `CLAUDE_PEERS_BELLS` file is woken by its own bell instead (`docs/bell.md`). lead-wake gets everything else: a machine with no bell, or a seat with no row or saved route. An id that is not `[a-zA-Z0-9_-]{3,64}` is stored as `wake: no-route` and the edge is not called. If `LEAD_WAKE_URL` is unset and no bell covers the seat, the wake is `unconfigured` (or `no-route` when bells are configured but the seat has no route) and the edge is not called.
 
 The sender sees `wake: sent`, `failed`, `no-route`, or `unconfigured` on the same response. `no-route` and `failed` are errors. A live seat has no wake line.
 

@@ -408,7 +408,7 @@ class DeliveryClock {
       globalThis.setTimeout = ((callback, ms, ...args) => {
         if (ms !== 200) return realSetTimeout(callback, ms, ...args);
         const deadline = Date.now() + ms;
-        writeFileSync(${JSON.stringify(`${this.dir}/delaying`)}, "pending");
+        writeFileSync(${JSON.stringify(`${this.dir}/delaying`)}, "held");
         const tick = () => Date.now() >= deadline
           ? callback(...args) : realSetTimeout(tick, 5);
         return realSetTimeout(tick, 5);
@@ -422,7 +422,7 @@ class DeliveryClock {
   }
 
   async waitForDelay() {
-    await waitUntil(() => existsSync(`${this.dir}/delaying`), "pending response delay");
+    await waitUntil(() => existsSync(`${this.dir}/delaying`), "response delay");
   }
 
   close() {
@@ -677,7 +677,7 @@ describe("server.ts payload v2 delivery client", () => {
       }
     });
 
-    test(`${transport} cancels the first pending push when ack wins the response delay`, async () => {
+    test(`${transport} cancels the first push when ack wins the response delay`, async () => {
       const clock = new DeliveryClock();
       const frames: string[] = [];
       const socketPath = `${clock.dir}/inbox.sock`;
@@ -690,7 +690,7 @@ describe("server.ts payload v2 delivery client", () => {
         if (transport === "inbox") await new Promise<void>(resolve => inbox.listen(socketPath, resolve));
         const harness = await startClient(path => {
           if (path === "/register") return { json: {
-            id: "server-protocol-test-peer", role: "owner", lease_id: "pending-lease",
+            id: "server-protocol-test-peer", role: "owner", lease_id: "open-lease",
           } };
           if (path === "/claim-messages") return { json: { messages: [{
             id: 705, from_id: "fake-sender", to_id: "server-protocol-test-peer",
@@ -719,7 +719,7 @@ describe("server.ts payload v2 delivery client", () => {
   }
 
   for (const disabled of [false, true]) {
-    test(`ack fences pending poll and manual sender lookups (channel disabled=${disabled})`, async () => {
+    test(`ack fences an in-flight poll and manual sender lookups (channel disabled=${disabled})`, async () => {
       const clock = new DeliveryClock();
       let release!: () => void;
       const gate = new Promise<void>(resolve => { release = resolve; });

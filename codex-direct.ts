@@ -7,6 +7,8 @@
  * registers a short-lived peer, sends a message, and can poll for replies.
  */
 
+import { formatSendResult, SEND_DEADLINE_MS } from "./shared/message-contract.ts";
+
 export {};
 
 type ClaudePeersEnv = {
@@ -69,7 +71,7 @@ async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
     method: body ? "POST" : "GET",
     headers: headers(),
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(path === "/send-message" ? 10_000 : 5000),
+    signal: AbortSignal.timeout(SEND_DEADLINE_MS),
   });
   if (!res.ok) throw new Error(`${path}: ${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
@@ -176,8 +178,9 @@ if (cmd === "status") {
       text: message,
     });
     if (!result.ok) throw new Error(result.error ?? "send failed");
-    console.log(`sent from ${id} to ${toId}${result.wake ? `\nwake: ${result.wake}` : ""}`);
-    if (result.wake === "no-route" || result.wake === "failed") process.exitCode = 1;
+    const formatted = formatSendResult(toId, result);
+    console.log(formatted.text);
+    if (formatted.isError) process.exitCode = 1;
   } finally {
     if (!fromId) await unregister(id);
   }

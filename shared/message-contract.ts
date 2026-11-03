@@ -1,6 +1,7 @@
 import type { SendMessageRequest, SendMessageResponse } from "./types.ts";
 
 export const messageContractVersion = 1;
+export const SEND_DEADLINE_MS = 10_000;
 export const messageToolProperties = {
   kind: { type: "string" as const, enum: ["request", "reply", "notification"], description: "request asks for work; reply answers an earlier request; notification needs no answer. Default request." },
   reply_to_id: { type: "integer" as const, minimum: 1, description: "Original message ID when replying. Sets kind=reply if omitted." },
@@ -22,7 +23,7 @@ export async function sendPeerMessage(
   return call("/send-message", { ...body, ...metadata });
 }
 
-export function formatSendResult(toId: string, result: { message_id?: number; wake?: string }): { text: string; isError: boolean } {
+export function formatSendResult(toId: string, result: { ok?: boolean; message_id?: number; wake?: string }): { text: string; isError: boolean } {
   const line = `Message sent to peer ${toId}. Message ID: ${result.message_id ?? "unavailable"}.`;
   return {
     text: result.wake ? `${line}\nwake: ${result.wake}` : line,

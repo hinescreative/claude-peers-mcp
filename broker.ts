@@ -16,6 +16,16 @@ import { Database } from "bun:sqlite";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { messageContractVersion } from "./shared/message-contract.ts";
+import {
+  bellPeerId,
+  loadBells,
+  mergeRuntime,
+  needsWake,
+  normalizeRuntime,
+  parseRuntime,
+  pidAlive,
+  routeIsFresh,
+} from "./bell-protocol.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -118,9 +128,11 @@ function maybeReloadTokens(): void {
 
 // --- Database setup ---
 
+const DB_BUSY_MS = 3_000;
+const SEND_BUSY_MS = 1_000;
 const db = new Database(DB_PATH);
 db.run("PRAGMA journal_mode = WAL");
-db.run("PRAGMA busy_timeout = 3000");
+db.run(`PRAGMA busy_timeout = ${DB_BUSY_MS}`);
 
 db.run(`
   CREATE TABLE IF NOT EXISTS peers (
@@ -253,9 +265,11 @@ try {
 
 // Additive migration keeps existing mail readable. Do not hide migration failures.
 const messageColumns = new Set((db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map(row => row.name));
-for (const [name, definition] of Object.entries({ kind: "TEXT NOT NULL DEFAULT 'request'", reply_to_id: "INTEGER", client_message_id: "TEXT" })) {
+for (const [name, definition] of Object.entries({ kind: "TEXT NOT NULL DEFAULT 'request'", reply_to_id: "INTEGER", client_message_id: "TEXT", wake_state: "TEXT" })) {
   if (!messageColumns.has(name)) db.run(`ALTER TABLE messages ADD COLUMN ${name} ${definition}`);
 }
+const migratedMessageColumns = new Set((db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map(row => row.name));
+if (migratedMessageColumns.has("wake_command_id")) db.run("ALTER TABLE messages DROP COLUMN wake_command_id");
 db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id ON messages(from_id, client_message_id) WHERE client_message_id IS NOT NULL");
 
 db.run(`
@@ -275,10 +289,83 @@ db.run(`
   ON messages (to_id, delivered, claim_expires_at, sent_at, id)
 `);
 
-function deletePeerAndUndeliveredMessages(id: string, spareMessageId?: number): void {
+// Survives unregister and reap. A released seat's row is gone; the next send
+// still knows which machine and cwd to wake.
+db.run(`
+  CREATE TABLE IF NOT EXISTS peer_routes (
+    id TEXT NOT NULL,
+    machine TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    runtime TEXT,
+    pid INTEGER,
+    requested_id TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (id, machine)
+  )
+`);
+try { db.run("ALTER TABLE peer_routes ADD COLUMN requested_id TEXT"); } catch { /* already there */ }
+try { db.run("ALTER TABLE peer_routes ADD COLUMN effective_id TEXT"); } catch { /* already there */ }
+try { db.run("ALTER TABLE peers ADD COLUMN requested_id TEXT"); } catch { /* already there */ }
+
+const parsedRouteTtl = Number(process.env.CLAUDE_PEERS_ROUTE_TTL_MS ?? String(7 * 24 * 60 * 60 * 1000));
+const ROUTE_TTL_MS = Number.isFinite(parsedRouteTtl) && parsedRouteTtl >= 0 ? parsedRouteTtl : 7 * 24 * 60 * 60 * 1000;
+
+const LOCAL_MACHINES = new Set(
+  [require("os").hostname(), ...(process.env.CLAUDE_PEERS_LOCAL_MACHINES ?? "").split(",")]
+    .map((name) => name.trim())
+    .filter(Boolean),
+);
+
+function deletePeerAndUndeliveredMessages(id: string): void {
+  // The row goes. Undelivered mail stays so a wake can still hand it over.
+  const row = db.query("SELECT id, machine, cwd, runtime, pid FROM peers WHERE id = ?").get(id) as
+    | { id: string; machine: string; cwd: string; runtime: string | null; pid: number }
+    | null;
+  if (row?.cwd) rememberRoute({ id: row.id, machine: row.machine, cwd: row.cwd, runtime: row.runtime, pid: row.pid });
   db.run("DELETE FROM peer_leases WHERE peer_id = ?", [id]);
   db.run("DELETE FROM peers WHERE id = ?", [id]);
-  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0 AND id <> ?", [id, spareMessageId ?? -1]);
+}
+
+function rememberRoute(row: {
+  id: string;
+  machine: string;
+  cwd: string;
+  runtime: string | null;
+  pid: number | null;
+  requestedId?: string | null;
+}): void {
+  if (!row.cwd) return;
+  const stable = row.requestedId || row.id;
+  if (row.id !== stable) return;
+  const other = db.query("SELECT machine FROM peer_routes WHERE id = ? AND machine <> ?").get(stable, row.machine) as { machine: string } | null;
+  if (other) {
+    console.error(`[claude-peers broker] route ${stable} belongs to ${other.machine}; refused a write from ${row.machine}`);
+    return;
+  }
+  db.run(
+    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id, machine) DO UPDATE SET
+       cwd = excluded.cwd,
+       pid = excluded.pid,
+       effective_id = excluded.effective_id,
+       runtime = excluded.runtime,
+       requested_id = COALESCE(peer_routes.requested_id, excluded.requested_id),
+       updated_at = excluded.updated_at`,
+    [stable, row.machine, row.cwd, row.runtime, row.pid, stable, row.id, new Date().toISOString()],
+  );
+}
+
+function touchRoute(peerId: string): void {
+  const peer = db.query("SELECT requested_id, machine FROM peers WHERE id = ?").get(peerId) as { requested_id: string | null; machine: string } | null;
+  const stable = peer?.requested_id || peerId;
+  // A suffix is a sibling. Only the base seat refreshes the route.
+  if (!peer || stable !== peerId) return;
+  db.run("UPDATE peer_routes SET updated_at = ? WHERE id = ? AND machine = ?", [new Date().toISOString(), stable, peer.machine]);
+}
+
+function machineIsLocal(machine: string): boolean {
+  return LOCAL_MACHINES.has(machine);
 }
 
 function peerIsStale(peer: Pick<Peer, "last_seen">): boolean {
@@ -293,7 +380,6 @@ function touchPeer(id: string): void {
 // Clean up stale peers on startup and before broker operations. Local host peers
 // get a PID check; all peers are also bounded by last_seen TTL.
 function cleanStalePeers(spareMessageId?: number) {
-  const hostname = require("os").hostname();
   const peers = db.query("SELECT id, pid, machine, last_seen FROM peers").all() as {
     id: string;
     pid: number;
@@ -302,25 +388,17 @@ function cleanStalePeers(spareMessageId?: number) {
   }[];
 
   for (const peer of peers) {
-    const deadLocal = peer.machine === hostname && !pidAlive(peer.pid);
+    const deadLocal = machineIsLocal(peer.machine) && !pidAlive(peer.pid);
     if (!peerIsStale(peer) && !deadLocal) continue;
-    deletePeerAndUndeliveredMessages(peer.id, spareMessageId);
+    deletePeerAndUndeliveredMessages(peer.id);
   }
+  // Mail outlives its seat so a wake can hand it over, but not past a day.
+  // A retry's own message is spared.
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   db.run(
     "DELETE FROM messages WHERE delivered = 0 AND sent_at < ? AND id <> ? AND to_id NOT IN (SELECT id FROM peers)",
     [cutoff, spareMessageId ?? -1],
   );
-}
-
-function pidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 cleanStalePeers();
@@ -418,10 +496,10 @@ const selectPeersByMachine = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, kind, reply_to_id, client_message_id)
-  VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, kind, reply_to_id, client_message_id, wake_state)
+  VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
 `);
-const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id FROM messages WHERE from_id = ? AND client_message_id = ?");
+const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id, wake_state FROM messages WHERE from_id = ? AND client_message_id = ?");
 const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ?");
 
 const selectUndelivered = db.prepare(`
@@ -595,11 +673,6 @@ function normalizeParentId(id: unknown): string | null {
   return trimmed || null;
 }
 
-function normalizeRuntime(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim().slice(0, 32);
-  return /^[a-zA-Z0-9_-]+$/.test(trimmed) ? trimmed : null;
-}
 
 function normalizeRings(value: unknown): string | null {
   let arr: unknown[] | null = null;
@@ -614,7 +687,7 @@ function normalizeRings(value: unknown): string | null {
     }
   }
   if (!arr) return null;
-  const nums = arr.filter((v): v is number => Number.isInteger(v) && v >= 0 && v <= 3);
+  const nums = arr.filter((v): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 3);
   return nums.length ? JSON.stringify(nums) : null;
 }
 
@@ -627,13 +700,13 @@ function normalizeBlockedOn(value: unknown): string | null {
 
 function decodeRings(raw: unknown): number[] | null {
   if (Array.isArray(raw)) {
-    return raw.filter((v): v is number => Number.isInteger(v) && v >= 0 && v <= 3);
+    return raw.filter((v): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 3);
   }
   if (typeof raw !== "string" || !raw) return null;
   try {
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed)
-      ? parsed.filter((v: unknown): v is number => Number.isInteger(v) && v >= 0 && v <= 3)
+      ? parsed.filter((v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 3)
       : null;
   } catch {
     return null;
@@ -709,7 +782,15 @@ function replacePeerRegistration(
   const carriedContextUsed = contextUsed ?? prior?.context_used ?? null;
   const carriedContextNote = contextNote === "" ? (prior?.context_note ?? "") : contextNote;
   const parentId = normalizeParentId(body.parent_id) ?? prior?.parent_id ?? null;
-  const runtime = normalizeRuntime(body.runtime);
+  const requested = normalizeRequestedId(body.requested_id);
+  const isBase = !requested || requested === id;
+  const saved = isBase && requested ? freshRoute(requested, machine) : null;
+  // A register with no runtime does not inherit one. A harness-only runtime keeps the bound thread.
+  const incomingRuntime = normalizeRuntime(body.runtime);
+  const runtime = incomingRuntime === null ? null : mergeRuntime(
+    incomingRuntime,
+    isBase ? (saved?.runtime ?? prior?.runtime ?? null) : (prior?.runtime ?? null),
+  );
   const rings = normalizeRings(body.rings) ?? (typeof prior?.rings === "string" ? prior.rings : normalizeRings(prior?.rings));
   const blockedOn = prior?.blocked_on ?? null;
   const blockedSince = prior?.blocked_since ?? null;
@@ -737,6 +818,11 @@ function replacePeerRegistration(
     blockedOn,
     blockedSince
   );
+  const stable = requested ?? id;
+  db.run("UPDATE peers SET requested_id = ? WHERE id = ?", [stable, id]);
+  if (isBase && body.cwd) {
+    rememberRoute({ id, machine, cwd: body.cwd, runtime, pid: body.pid, requestedId: stable });
+  }
 }
 
 // --- Per-instance peer ids ---
@@ -772,7 +858,7 @@ function instanceSuffix(instanceId: string, length: number): string {
   return hash.toString(16).padStart(8, "0").slice(0, length);
 }
 
-// Truncate the BASE before appending, never the finished id: slicing after the
+// Truncate the BASE before the suffix is attached, never the finished id: slicing after the
 // suffix is attached would cut the suffix off and recreate the collision.
 function suffixedPeerId(base: string, instanceId: string, length: number): string {
   const room = MAX_PEER_ID_LENGTH - length - 1;
@@ -911,11 +997,17 @@ function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; found: boolean 
   const used = body.context_used !== undefined ? normalizeOptionalInt(body.context_used) : undefined;
   if (window !== undefined || used !== undefined) {
     const result = updateHeartbeatContext.run(now, window ?? null, used ?? null, body.id);
-    if (result.changes > 0 && lease) extendLease(lease, nowDate);
+    if (result.changes > 0) {
+      if (lease) extendLease(lease, nowDate);
+      touchRoute(body.id);
+    }
     return { ok: true, found: result.changes > 0 };
   }
   const result = updateLastSeen.run(now, body.id);
-  if (result.changes > 0 && lease) extendLease(lease, nowDate);
+  if (result.changes > 0) {
+    if (lease) extendLease(lease, nowDate);
+    touchRoute(body.id);
+  }
   return { ok: true, found: result.changes > 0 };
 }
 
@@ -960,6 +1052,20 @@ function handleSetNickname(body: SetNicknameRequest): { ok: boolean; error?: str
     return { ok: false, error: "peer not found or stale" };
   }
   return { ok: true };
+}
+
+function handleSetRuntime(body: { id?: string; runtime?: unknown } & LeaseCredentials): { ok: boolean; found: boolean; runtime?: string } {
+  if (!body?.id) throw new HttpError(400, "set-runtime requires a peer id");
+  requireLeaseOwner(body.id, body);
+  const runtime = normalizeRuntime(body.runtime);
+  if (!runtime) throw new HttpError(400, "invalid runtime");
+  const result = db.run("UPDATE peers SET runtime = ? WHERE id = ?", [runtime, body.id]);
+  if (result.changes === 0) return { ok: false, found: false };
+  const row = db.query("SELECT id, machine, cwd, pid FROM peers WHERE id = ?").get(body.id) as
+    | { id: string; machine: string; cwd: string; pid: number }
+    | null;
+  if (row?.cwd) rememberRoute({ id: row.id, machine: row.machine, cwd: row.cwd, runtime, pid: row.pid });
+  return { ok: true, found: true, runtime };
 }
 
 function handleSetContext(body: SetContextRequest): void {
@@ -1008,24 +1114,16 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // For local peers, verify process is still alive
-  const hostname = require("os").hostname();
   peers = peers.filter((p) => {
     if (peerIsStale(p)) {
       deletePeerAndUndeliveredMessages(p.id);
       return false;
     }
 
-    if (p.machine === hostname) {
-      try {
-        process.kill(p.pid, 0);
-        return true;
-      } catch {
-        deletePeerAndUndeliveredMessages(p.id);
-        return false;
-      }
+    if (machineIsLocal(p.machine) && !pidAlive(p.pid)) {
+      deletePeerAndUndeliveredMessages(p.id);
+      return false;
     }
-    // Remote peers — trust heartbeat-based cleanup
     return true;
   });
 
@@ -1058,9 +1156,11 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
   let duplicate = false;
   let existingId: number | undefined;
   if (clientId !== null) {
-    const existing = selectMessageByClientId.get(body.from_id, clientId) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null } | null;
+    const existing = selectMessageByClientId.get(body.from_id, clientId) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null; wake_state: string | null } | null;
     if (existing) {
       if (existing.to_id !== body.to_id || existing.text !== body.text || existing.kind !== kind || existing.reply_to_id !== replyTo) throw new HttpError(409, "client_message_id already used for a different message");
+      // A wake T3 may already have accepted is not sent twice. Any other state is decided again below.
+      if (existing.wake_state === "sent") return { ok: true, message_id: existing.id, duplicate: true, wake: "sent" };
       duplicate = true;
       existingId = existing.id;
     }
@@ -1070,33 +1170,78 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
     if (!original || original.kind !== "request" || original.to_id !== body.from_id || original.from_id !== body.to_id) throw new HttpError(400, "reply must reverse the participants of an existing request");
   }
 
-  const before = db.query("SELECT id, cwd, machine FROM peers WHERE id = ?").get(body.to_id) as
-    | { id: string; cwd: string; machine: string }
-    | null;
   cleanStalePeers(duplicate ? existingId : undefined);
   requireLeaseOwner(body.from_id, body);
   touchPeer(body.from_id);
-  const after = db.query("SELECT id, last_seen, runtime FROM peers WHERE id = ?").get(body.to_id) as
-    | { id: string; last_seen: string; runtime: string | null }
+
+  const target = db.query("SELECT id, last_seen, machine, cwd, runtime, pid FROM peers WHERE id = ?").get(body.to_id) as
+    | { id: string; last_seen: string; machine: string; cwd: string; runtime: string | null; pid: number }
     | null;
+  const remembered = target ? null : rememberedRoute(body.to_id);
+  const facts = target ?? remembered;
+  const lease = target ? getPeerLease(target.id) : null;
+  const known = /^[a-zA-Z0-9_-]{3,64}$/.test(body.to_id);
+  // An id that cannot be a seat is never forwarded. A seat with no row or route still is:
+  // the lead-wake edge has its own routes file.
+  const settled = !known
+    ? "no-route"
+    : facts && !needsWake({
+      present: Boolean(target),
+      stale: target ? peerIsStale(target) : true,
+      runtime: facts.runtime,
+      ownerLive: lease ? !leaseIsExpired(lease) : true,
+    })
+      ? "skipped"
+      : null;
+  if (target && peerIsStale(target)) deletePeerAndUndeliveredMessages(target.id);
 
   const message_id = duplicate
     ? existingId!
-    : Number(insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId).lastInsertRowid);
-  const known = /^[a-zA-Z0-9_-]{3,64}$/.test(body.to_id);
-  const live = Boolean(after && !peerIsStale(after) && after.runtime !== "poll");
-  const wake = !known ? "no-route" : live ? undefined : process.env.LEAD_WAKE_URL ? undefined : "unconfigured";
+    : Number(insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId, settled).lastInsertRowid);
+  if (duplicate) db.run("UPDATE messages SET wake_state = ? WHERE id = ?", [settled, message_id]);
+  // A live seat with a push channel gets no wake line.
+  if (settled === "skipped") return { ok: true, message_id, duplicate };
+  if (settled) return { ok: true, message_id, duplicate, wake: settled };
   return {
     ok: true,
     message_id,
     duplicate,
-    kind,
-    wake,
-    forward: known && !live && Boolean(process.env.LEAD_WAKE_URL),
-    cwd: before?.cwd ?? null,
-    machine: before?.machine ?? null,
+    wake: "needed",
+    target: {
+      to_id: body.to_id,
+      from_id: body.from_id,
+      kind,
+      machine: facts?.machine ?? null,
+      cwd: facts?.cwd ?? null,
+      runtime: facts?.runtime ?? null,
+      pid: facts?.pid ?? null,
+    },
   };
 });
+
+type WakeTarget = {
+  to_id: string;
+  from_id: string;
+  kind: string;
+  machine: string | null;
+  cwd: string | null;
+  runtime: string | null;
+  pid: number | null;
+};
+
+const wakesInFlight = new Map<number, Promise<string>>();
+
+function outboundBellToken(): string | null {
+  const explicit = process.env.CLAUDE_PEERS_BELL_TOKEN?.trim();
+  if (explicit) return explicit;
+  if (TOKENS_FILE) {
+    try {
+      const line = readFileSync(TOKENS_FILE, "utf8").split(/\r?\n/).map((token) => token.trim()).find(Boolean);
+      if (line) return line;
+    } catch { /* fall through to the env token */ }
+  }
+  return ENV_TOKENS[0] || null;
+}
 
 function outboundToken(): string {
   const explicit = process.env.CLAUDE_PEERS_TOKEN?.trim();
@@ -1109,7 +1254,7 @@ function outboundToken(): string {
   }
 }
 
-async function forwardWake(body: { to_id: string; from_id: string; kind: string; message_id: number; cwd: string | null; machine: string | null }) {
+async function forwardLeadWake(body: { to_id: string; from_id: string; kind: string; message_id: number; cwd: string | null; machine: string | null }) {
   const url = process.env.LEAD_WAKE_URL ?? "";
   try {
     const res = await fetch(url, {
@@ -1131,28 +1276,153 @@ async function forwardWake(body: { to_id: string; from_id: string; kind: string;
   }
 }
 
-async function handleSendMessage(body: SendMessageRequest) {
-  const stored = sendMessage(body) as {
-    message_id: number;
-    duplicate: boolean;
-    kind: string;
-    wake?: string;
-    forward: boolean;
-    cwd: string | null;
-    machine: string | null;
-  };
-  if (!stored.forward) {
-    return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, ...(stored.wake ? { wake: stored.wake } : {}) };
+function bellOrigin(machine: string | null): string | null {
+  const path = process.env.CLAUDE_PEERS_BELLS ?? "";
+  if (!path || !machine) return null;
+  try {
+    return loadBells(readFileSync(path, "utf8"))[machine] ?? null;
+  } catch {
+    return null;
   }
-  const wake = await forwardWake({
-    to_id: body.to_id,
-    from_id: body.from_id,
-    kind: stored.kind,
-    message_id: stored.message_id,
-    cwd: stored.cwd,
-    machine: stored.machine,
-  });
-  return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, wake };
+}
+
+async function forwardWake(target: { to_id: string; machine: string; cwd: string; runtime: string | null; pid: number | null }, messageId: number) {
+  const origin = bellOrigin(target.machine);
+  if (!origin) return { ok: false, error: "bell-unconfigured" };
+  const token = outboundBellToken();
+  if (!token) return { ok: false, error: "bell-unconfigured" };
+  try {
+    const res = await fetch(`${origin}/wake`, {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        to_id: target.to_id,
+        machine: target.machine,
+        cwd: target.cwd,
+        runtime: target.runtime,
+        pid: target.pid,
+        message_id: messageId,
+      }),
+      signal: AbortSignal.timeout(3_000),
+    });
+    const json = await res.json().catch(() => null) as { ok?: boolean; error?: string; threadId?: string; dispatchMode?: string; tmux?: string } | null;
+    if (json?.error === "no-route") return { ok: false, error: "no-route" };
+    if (!res.ok || !json?.ok) return { ok: false, error: "bell-unreachable" };
+    return { ok: true, threadId: json.threadId ?? null, dispatchMode: json.dispatchMode ?? null, tmux: json.tmux ?? null };
+  } catch {
+    return { ok: false, error: "bell-unreachable" };
+  }
+}
+
+function withSendBusy<T>(work: () => T): T {
+  db.run(`PRAGMA busy_timeout = ${SEND_BUSY_MS}`);
+  try {
+    return work();
+  } finally {
+    db.run(`PRAGMA busy_timeout = ${DB_BUSY_MS}`);
+  }
+}
+
+async function handleSendMessage(body: SendMessageRequest) {
+  // Handler budget: commit ≤1 s, wake ≤3 s, bookkeeping ≤1 s, under the oldest sender's 5 s.
+  const stored = withSendBusy(() => sendMessage(body)) as {
+    ok: boolean;
+    error?: string;
+    message_id?: number;
+    duplicate?: boolean;
+    wake?: string;
+    target?: WakeTarget;
+  };
+  if (!stored.ok || stored.wake !== "needed" || !stored.target || !stored.message_id) return stored;
+  const messageId = stored.message_id;
+  const running = wakesInFlight.get(messageId);
+  const job = running ?? dispatchWake(stored.target, messageId);
+  if (!running) wakesInFlight.set(messageId, job);
+  let wake = "failed";
+  try {
+    wake = await job;
+  } catch {
+    wake = "failed";
+  } finally {
+    if (!running) wakesInFlight.delete(messageId);
+  }
+  try {
+    withSendBusy(() => {
+      db.run("UPDATE messages SET wake_state = ? WHERE id = ?", [wake, messageId]);
+    });
+  } catch {
+    // The mail is already committed. A bookkeeping error must not hide the accepted id.
+  }
+  return { ok: true, message_id: messageId, duplicate: Boolean(stored.duplicate), wake };
+}
+
+// A machine with a bell is woken by its bell. Anything else goes to the lead-wake edge.
+async function dispatchWake(target: WakeTarget, messageId: number): Promise<string> {
+  if (target.machine && target.cwd !== null && bellOrigin(target.machine)) {
+    const woke = await forwardWake({ to_id: target.to_id, machine: target.machine, cwd: target.cwd, runtime: target.runtime, pid: target.pid }, messageId);
+    return woke.ok ? "sent" : woke.error === "no-route" ? "no-route" : woke.error === "bell-unconfigured" ? "unconfigured" : "failed";
+  }
+  if (process.env.LEAD_WAKE_URL) {
+    return forwardLeadWake({ to_id: target.to_id, from_id: target.from_id, kind: target.kind, message_id: messageId, cwd: target.cwd, machine: target.machine });
+  }
+  if (!process.env.CLAUDE_PEERS_BELLS) return "unconfigured";
+  return target.machine ? "unconfigured" : "no-route";
+}
+
+function handleSeedRoute(body: { id?: string; machine?: string; runtime?: string }): { ok: boolean } {
+  const id = typeof body?.id === "string" ? body.id.trim() : "";
+  const machine = typeof body?.machine === "string" ? body.machine.trim() : "";
+  const runtime = normalizeRuntime(body?.runtime);
+  if (!/^[a-zA-Z0-9_-]{3,64}$/.test(id) || !machine || !runtime || !parseRuntime(runtime).threadId) {
+    throw new HttpError(400, "seed-route requires id, machine, and a runtime with a thread id");
+  }
+  const other = db.query("SELECT machine FROM peer_routes WHERE id = ? AND machine <> ?").get(id, machine) as { machine: string } | null;
+  if (other) {
+    console.error(`[claude-peers broker] route ${id} belongs to ${other.machine}; refused a seed from ${machine}`);
+    throw new HttpError(409, "route belongs to another machine");
+  }
+  const now = new Date().toISOString();
+  db.run(
+    `INSERT INTO peer_routes (id, machine, cwd, runtime, pid, requested_id, effective_id, updated_at)
+     VALUES (?, ?, '', ?, null, ?, ?, ?)
+     ON CONFLICT(id, machine) DO UPDATE SET runtime = excluded.runtime, updated_at = excluded.updated_at`,
+    [id, machine, runtime, id, id, now],
+  );
+  return { ok: true };
+}
+
+function freshRoute(id: string, machine: string): { id: string; machine: string; cwd: string; runtime: string | null; pid: number } | null {
+  const row = db.query("SELECT id, machine, cwd, runtime, pid, updated_at FROM peer_routes WHERE id = ? AND machine = ?").get(id, machine) as
+    | { id: string; machine: string; cwd: string; runtime: string | null; pid: number; updated_at: string }
+    | null;
+  if (!row || !routeIsFresh(row.updated_at, Date.now(), ROUTE_TTL_MS)) return null;
+  return row;
+}
+
+function rememberedRoute(id: string): { id: string; machine: string; cwd: string; runtime: string | null; pid: number } | null {
+  const machines = db.query("SELECT machine FROM peer_routes WHERE id = ?").all(id) as { machine: string }[];
+  if (machines.length !== 1 || !machines[0]) return null;
+  return freshRoute(id, machines[0].machine);
+}
+
+function handleReapDead(body: { id?: string; peer_id?: string; pid?: number; machine?: string } & LeaseCredentials): { ok: boolean; reaped: boolean; undelivered: number } {
+  if (!body?.id || !body.peer_id || !body.machine) throw new HttpError(400, "reap requires the bell id, peer id, and machine");
+  requireLeaseOwner(body.id, body);
+  const peer = db.query("SELECT id, pid, machine, cwd, runtime FROM peers WHERE id = ?").get(body.peer_id) as
+    | { id: string; pid: number; machine: string; cwd: string; runtime: string | null }
+    | null;
+  if (!peer) return { ok: true, reaped: false, undelivered: 0 };
+  if (peer.machine !== body.machine || Number(peer.pid) !== Number(body.pid)) {
+    throw new HttpError(409, "reap target does not match");
+  }
+  if (body.id !== bellPeerId(peer.machine)) throw new HttpError(403, "only that machine's bell can reap");
+  const undelivered = (db.query("SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0").get(peer.id) as { n: number }).n;
+  deletePeerAndUndeliveredMessages(peer.id);
+  return { ok: true, reaped: true, undelivered };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -1230,6 +1500,7 @@ function handleAckMessages(body: AckMessagesRequest): AckMessagesResponse {
 
 function handleUnregister(body: UnregisterRequest): void {
   requireLeaseOwner(body.id, body);
+  touchRoute(body.id);
   deletePeerLease.run(body.id);
   deletePeer.run(body.id);
 }
@@ -1279,6 +1550,22 @@ Bun.serve({
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
           return Response.json(await handleSendMessage(body as SendMessageRequest));
+        case "/set-runtime":
+          return Response.json(handleSetRuntime(body as { id?: string; runtime?: unknown } & LeaseCredentials));
+        case "/seed-route":
+          return Response.json(handleSeedRoute(body as { id?: string; machine?: string; runtime?: string }));
+        case "/reap-dead": {
+          const reapBody = body as { id?: string; peer_id?: string; pid?: number; machine?: string } & LeaseCredentials;
+          const reaped = handleReapDead(reapBody);
+          if (reaped.reaped && reaped.undelivered > 0 && typeof reapBody.peer_id === "string" && typeof reapBody.machine === "string") {
+            const route = db.query("SELECT id, machine, cwd, runtime, pid FROM peer_routes WHERE id = ? AND machine = ?").get(reapBody.peer_id, reapBody.machine) as
+              | { id: string; machine: string; cwd: string; runtime: string | null; pid: number }
+              | null;
+            const mail = db.query("SELECT id FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY id LIMIT 1").get(reapBody.peer_id) as { id: number } | null;
+            if (route && mail) await forwardWake({ to_id: route.id, machine: route.machine, cwd: route.cwd, runtime: route.runtime, pid: route.pid }, mail.id);
+          }
+          return Response.json(reaped);
+        }
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/claim-messages":
