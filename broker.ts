@@ -347,6 +347,14 @@ function checkAuth(req: Request): Response | null {
   return null;
 }
 
+// Every id that ever registered or carried mail. A send to such a name is a send
+// to that seat (stored, offered to lead-wake), never resolved as some other
+// peer's nickname, even after the seat's row is swept.
+db.run("CREATE TABLE IF NOT EXISTS peer_ids_seen (id TEXT PRIMARY KEY, first_seen TEXT NOT NULL)");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT id, last_seen FROM peers");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT from_id, min(sent_at) FROM messages GROUP BY from_id");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT to_id, min(sent_at) FROM messages WHERE delivered = 1 GROUP BY to_id");
+
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
@@ -423,16 +431,25 @@ const insertMessage = db.prepare(`
 `);
 const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id FROM messages WHERE from_id = ? AND client_message_id = ?");
 const selectPeerId = db.prepare("SELECT id FROM peers WHERE id = ?");
-const selectPeersByNickname = db.prepare("SELECT id, nickname FROM peers WHERE nickname <> '' AND lower(nickname) = lower(?) ORDER BY id");
+const selectSeenId = db.prepare("SELECT id FROM peer_ids_seen WHERE id = ?");
+const insertSeenId = db.prepare("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) VALUES (?, ?)");
+const selectNicknamedPeers = db.prepare("SELECT id, nickname FROM peers WHERE nickname <> '' ORDER BY id");
 
-// A send names its recipient by peer id. When no peer has that id, a nickname
-// that exactly one registered peer holds is accepted and the message goes to
-// that peer's id; a nickname several peers hold is refused with their ids. Before
-// this, "assistant" was stored under to_id=assistant and never read (card 719).
+// Nickname matching folds case here, not in SQL: SQLite's lower() folds ASCII only.
+function nicknameKey(name: string): string {
+  return name.trim().normalize("NFKC").toLowerCase();
+}
+
+// A send names its recipient by peer id. When no peer has that id, and the name
+// was never an id, a nickname that exactly one registered peer holds is accepted
+// and the message goes to that peer's id; a nickname several peers hold is refused
+// with their ids. Before this, "assistant" was stored under to_id=assistant and
+// never read (card 719).
 function resolveRecipient(toId: string): { id: string; nickname?: string } {
   const trimmed = toId.trim();
-  if (selectPeerId.get(trimmed)) return { id: trimmed };
-  const matches = selectPeersByNickname.all(trimmed) as { id: string; nickname: string }[];
+  if (selectPeerId.get(trimmed) || selectSeenId.get(trimmed)) return { id: trimmed };
+  const key = nicknameKey(trimmed);
+  const matches = (selectNicknamedPeers.all() as { id: string; nickname: string }[]).filter((peer) => nicknameKey(peer.nickname) === key);
   if (matches.length === 1) return { id: matches[0].id, nickname: matches[0].nickname };
   if (matches.length > 1) {
     throw new HttpError(409, `nickname "${trimmed}" names ${matches.length} peers (${matches.map((m) => m.id).join(", ")}); send to one peer id`);
@@ -692,6 +709,7 @@ function replacePeerRegistration(
   const tier = normalizeTier(body.tier);
   const now = new Date().toISOString();
   const machine = body.machine || "unknown";
+  insertSeenId.run(id, now);
 
   // Preserve operator-set identity metadata across re-registrations: the
   // delete-then-insert below would otherwise wipe nickname/summary/context on
