@@ -28,12 +28,19 @@ export function formatSendResult(
 ): { text: string; isError: boolean } {
   const target = result.resolved_from && result.to_id ? `${result.to_id} (nickname ${result.resolved_from})` : toId;
   const line = `Message sent to peer ${target}. Message ID: ${result.message_id ?? "unavailable"}.`;
-  const isError = result.wake === "no-route" || result.wake === "failed";
-  const hint = isError
-    ? `\nNot delivered: no live peer has the id or nickname ${toId}, and the wake edge ${result.wake === "no-route" ? "has no route for it" : "did not answer"}. The message waits for a peer registered as ${result.to_id ?? toId} and is dropped if none claims it. Check list_peers.`
-    : "";
+  if (!result.wake) return { text: line, isError: false };
+  if (result.wake === "sent") return { text: `${line}\nwake: sent`, isError: false };
+  // no-route, failed and unconfigured all mean the mail is stored but nobody is
+  // reading it now. Say so, say why, and say when it would be read: lead-wake is
+  // off by choice on this fleet (10-25), so "failed" is the usual state, not breakage.
+  const why = result.wake === "no-route"
+    ? "the wake edge has no route for it"
+    : result.wake === "failed"
+      ? "the wake edge did not answer"
+      : "no wake edge is configured, so nothing starts the seat";
+  const stored = result.to_id ?? toId;
   return {
-    text: result.wake ? `${line}\nwake: ${result.wake}${hint}` : line,
-    isError,
+    text: `${line}\nwake: ${result.wake}\nNot delivered now: ${toId} is not a live seat (missing, stale or poll-only), and ${why}. A seat registered as ${stored} reads it when it next runs; it is dropped after a day if none does. Check list_peers.`,
+    isError: true,
   };
 }
