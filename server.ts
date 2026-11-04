@@ -407,7 +407,7 @@ Read the from_id, from_summary, from_cwd, and from_machine attributes to underst
 Available tools:
 - peer_status: Show this instance's own peer ID, nickname, broker, cwd, and summary
 - list_peers: Discover other Claude Code instances (scope: fleet/machine/directory/repo)
-- send_message: Send a message to another instance by ID
+- send_message: Send a message to another instance by ID, or by a nickname that exactly one peer holds
 - set_nickname: Set a short human-readable name for this instance
 - set_context: Set this instance's context window metadata
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
@@ -458,14 +458,14 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification. Works across machines.",
+      "Send a message to another Claude Code instance by peer ID, or by a nickname that exactly one peer holds. The message will be pushed into their session immediately via channel notification. Works across machines.",
     inputSchema: {
       type: "object" as const,
       properties: {
         ...messageToolProperties,
         to_id: {
           type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
+          description: "The peer ID of the target Claude Code instance (from list_peers), or a nickname that exactly one peer holds; a shared nickname is refused with the ids",
         },
         message: {
           type: "string" as const,

@@ -323,6 +323,14 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+// Every id that ever registered or carried mail. A send to such a name is a send
+// to that seat (stored, offered to lead-wake), never resolved as some other
+// peer's nickname, even after the seat's row is swept.
+db.run("CREATE TABLE IF NOT EXISTS peer_ids_seen (id TEXT PRIMARY KEY, first_seen TEXT NOT NULL)");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT id, last_seen FROM peers");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT from_id, min(sent_at) FROM messages GROUP BY from_id");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT to_id, min(sent_at) FROM messages WHERE delivered = 1 GROUP BY to_id");
+
 cleanStalePeers();
 
 // Periodically clean stale peers (every 30s)
@@ -422,6 +430,32 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0, ?, ?, ?)
 `);
 const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id FROM messages WHERE from_id = ? AND client_message_id = ?");
+const selectPeerId = db.prepare("SELECT id FROM peers WHERE id = ?");
+const selectSeenId = db.prepare("SELECT id FROM peer_ids_seen WHERE id = ?");
+const insertSeenId = db.prepare("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) VALUES (?, ?)");
+const selectNicknamedPeers = db.prepare("SELECT id, nickname FROM peers WHERE nickname <> '' ORDER BY id");
+
+// Nickname matching folds case here, not in SQL: SQLite's lower() folds ASCII only.
+function nicknameKey(name: string): string {
+  return name.trim().normalize("NFKC").toLowerCase();
+}
+
+// A send names its recipient by peer id. When no peer has that id, and the name
+// was never an id, a nickname that exactly one registered peer holds is accepted
+// and the message goes to that peer's id; a nickname several peers hold is refused
+// with their ids. Before this, "assistant" was stored under to_id=assistant and
+// never read (card 719).
+function resolveRecipient(toId: string): { id: string; nickname?: string } {
+  const trimmed = toId.trim();
+  if (selectPeerId.get(trimmed) || selectSeenId.get(trimmed)) return { id: trimmed };
+  const key = nicknameKey(trimmed);
+  const matches = (selectNicknamedPeers.all() as { id: string; nickname: string }[]).filter((peer) => nicknameKey(peer.nickname) === key);
+  if (matches.length === 1) return { id: matches[0].id, nickname: matches[0].nickname };
+  if (matches.length > 1) {
+    throw new HttpError(409, `nickname "${trimmed}" names ${matches.length} peers (${matches.map((m) => m.id).join(", ")}); send to one peer id`);
+  }
+  return { id: trimmed };
+}
 const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ?");
 
 const selectUndelivered = db.prepare(`
@@ -675,6 +709,7 @@ function replacePeerRegistration(
   const tier = normalizeTier(body.tier);
   const now = new Date().toISOString();
   const machine = body.machine || "unknown";
+  insertSeenId.run(id, now);
 
   // Preserve operator-set identity metadata across re-registrations: the
   // delete-then-insert below would otherwise wipe nickname/summary/context on
@@ -1044,10 +1079,12 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return peers.map(decodePeer);
 }
 
-const sendMessage = db.transaction((body: SendMessageRequest) => {
-  if (!body || typeof body.from_id !== "string" || typeof body.to_id !== "string" || typeof body.text !== "string" || !body.text.trim() || Buffer.byteLength(body.text) > 65536) {
+const sendMessage = db.transaction((input: SendMessageRequest) => {
+  if (!input || typeof input.from_id !== "string" || typeof input.to_id !== "string" || typeof input.text !== "string" || !input.text.trim() || Buffer.byteLength(input.text) > 65536) {
     throw new HttpError(400, "send requires sender, recipient and nonempty text up to 64 KiB");
   }
+  const recipient = resolveRecipient(input.to_id);
+  const body: SendMessageRequest = recipient.id === input.to_id ? input : { ...input, to_id: recipient.id };
   const kind = body.kind ?? (body.reply_to_id !== undefined ? "reply" : "request");
   if (!["request", "reply", "notification"].includes(kind)) throw new HttpError(400, "invalid message kind");
   const replyTo = body.reply_to_id ?? null;
@@ -1095,6 +1132,8 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
     forward: known && !live && Boolean(process.env.LEAD_WAKE_URL),
     cwd: before?.cwd ?? null,
     machine: before?.machine ?? null,
+    to_id: body.to_id,
+    resolved_from: recipient.nickname ? input.to_id : undefined,
   };
 });
 
@@ -1140,19 +1179,22 @@ async function handleSendMessage(body: SendMessageRequest) {
     forward: boolean;
     cwd: string | null;
     machine: string | null;
+    to_id: string;
+    resolved_from?: string;
   };
+  const target = { to_id: stored.to_id, ...(stored.resolved_from ? { resolved_from: stored.resolved_from } : {}) };
   if (!stored.forward) {
-    return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, ...(stored.wake ? { wake: stored.wake } : {}) };
+    return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, ...target, ...(stored.wake ? { wake: stored.wake } : {}) };
   }
   const wake = await forwardWake({
-    to_id: body.to_id,
+    to_id: stored.to_id,
     from_id: body.from_id,
     kind: stored.kind,
     message_id: stored.message_id,
     cwd: stored.cwd,
     machine: stored.machine,
   });
-  return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, wake };
+  return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, ...target, wake };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
