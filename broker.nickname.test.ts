@@ -214,3 +214,49 @@ test("the sender's tool text names the resolved peer, and a failed wake says the
   expect(missed.text).toContain("Not delivered");
   expect(missed.text).toContain("nobody");
 });
+
+test("a database from before this change seeds its ids before the startup sweep", async () => {
+  // Simulate the upgrade: ids registered under the old broker have no peer_ids_seen rows.
+  expect((await post("/register", seat("mac-ghost"))).status).toBe(200);
+  expect((await post("/register", seat("mac-grabber", { nickname: "mac-ghost" }))).status).toBe(200);
+  await ageOut("mac-ghost");
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(DB);
+  db.run("DELETE FROM peer_ids_seen");
+  db.close();
+  proc?.kill();
+  await proc?.exited;
+  proc = Bun.spawn(["bun", "broker.ts"], {
+    cwd: import.meta.dir,
+    env: {
+      ...process.env,
+      CLAUDE_PEERS_PORT: String(PORT),
+      CLAUDE_PEERS_DB: DB,
+      CLAUDE_PEERS_TOKEN: "test-token",
+      CLAUDE_PEERS_TOKENS: "",
+      CLAUDE_PEERS_TOKENS_FILE: "",
+      LEAD_WAKE_URL: `http://127.0.0.1:${EDGE_PORT}/wake`,
+      CLAUDE_CODE_MESSAGING_SOCKET: "",
+    },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  let up = false;
+  for (let i = 0; i < 100 && !up; i++) {
+    try { up = (await fetch(BASE + "/health")).ok; } catch { /* not up */ }
+    if (!up) await Bun.sleep(50);
+  }
+  expect(up).toBe(true);
+  const seen = new Database(DB);
+  const ids = (seen.query("SELECT id FROM peer_ids_seen ORDER BY id").all() as { id: string }[]).map((r) => r.id);
+  const ghostRows = (seen.query("SELECT count(*) AS n FROM peers WHERE id = 'mac-ghost'").get() as { n: number }).n;
+  seen.close();
+  expect(ghostRows).toBe(0); // the startup sweep removed the stale row...
+  expect(ids).toContain("mac-ghost"); // ...after its id was recorded
+  expect(ids).toContain("mac-sender"); // a sender known only from messages is recorded too
+  const sent = await post("/send-message", { from_id: "mac-sender", to_id: "mac-ghost", text: "still the ghost's" });
+  expect(sent.json.to_id).toBe("mac-ghost");
+  expect(sent.json.resolved_from).toBeUndefined();
+  expect(wakes.at(-1).to_id).toBe("mac-ghost");
+  expect(await inbox("mac-grabber")).toEqual([]);
+});

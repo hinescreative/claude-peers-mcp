@@ -323,6 +323,14 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+// Every id that ever registered or carried mail. A send to such a name is a send
+// to that seat (stored, offered to lead-wake), never resolved as some other
+// peer's nickname, even after the seat's row is swept.
+db.run("CREATE TABLE IF NOT EXISTS peer_ids_seen (id TEXT PRIMARY KEY, first_seen TEXT NOT NULL)");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT id, last_seen FROM peers");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT from_id, min(sent_at) FROM messages GROUP BY from_id");
+db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT to_id, min(sent_at) FROM messages WHERE delivered = 1 GROUP BY to_id");
+
 cleanStalePeers();
 
 // Periodically clean stale peers (every 30s)
@@ -346,14 +354,6 @@ function checkAuth(req: Request): Response | null {
   }
   return null;
 }
-
-// Every id that ever registered or carried mail. A send to such a name is a send
-// to that seat (stored, offered to lead-wake), never resolved as some other
-// peer's nickname, even after the seat's row is swept.
-db.run("CREATE TABLE IF NOT EXISTS peer_ids_seen (id TEXT PRIMARY KEY, first_seen TEXT NOT NULL)");
-db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT id, last_seen FROM peers");
-db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT from_id, min(sent_at) FROM messages GROUP BY from_id");
-db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) SELECT to_id, min(sent_at) FROM messages WHERE delivered = 1 GROUP BY to_id");
 
 // --- Prepared statements ---
 
