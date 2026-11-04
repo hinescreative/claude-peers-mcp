@@ -422,6 +422,23 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0, ?, ?, ?)
 `);
 const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id FROM messages WHERE from_id = ? AND client_message_id = ?");
+const selectPeerId = db.prepare("SELECT id FROM peers WHERE id = ?");
+const selectPeersByNickname = db.prepare("SELECT id, nickname FROM peers WHERE nickname <> '' AND lower(nickname) = lower(?) ORDER BY id");
+
+// A send names its recipient by peer id. When no peer has that id, a nickname
+// that exactly one registered peer holds is accepted and the message goes to
+// that peer's id; a nickname several peers hold is refused with their ids. Before
+// this, "assistant" was stored under to_id=assistant and never read (card 719).
+function resolveRecipient(toId: string): { id: string; nickname?: string } {
+  const trimmed = toId.trim();
+  if (selectPeerId.get(trimmed)) return { id: trimmed };
+  const matches = selectPeersByNickname.all(trimmed) as { id: string; nickname: string }[];
+  if (matches.length === 1) return { id: matches[0].id, nickname: matches[0].nickname };
+  if (matches.length > 1) {
+    throw new HttpError(409, `nickname "${trimmed}" names ${matches.length} peers (${matches.map((m) => m.id).join(", ")}); send to one peer id`);
+  }
+  return { id: trimmed };
+}
 const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ?");
 
 const selectUndelivered = db.prepare(`
@@ -1044,10 +1061,12 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return peers.map(decodePeer);
 }
 
-const sendMessage = db.transaction((body: SendMessageRequest) => {
-  if (!body || typeof body.from_id !== "string" || typeof body.to_id !== "string" || typeof body.text !== "string" || !body.text.trim() || Buffer.byteLength(body.text) > 65536) {
+const sendMessage = db.transaction((input: SendMessageRequest) => {
+  if (!input || typeof input.from_id !== "string" || typeof input.to_id !== "string" || typeof input.text !== "string" || !input.text.trim() || Buffer.byteLength(input.text) > 65536) {
     throw new HttpError(400, "send requires sender, recipient and nonempty text up to 64 KiB");
   }
+  const recipient = resolveRecipient(input.to_id);
+  const body: SendMessageRequest = recipient.id === input.to_id ? input : { ...input, to_id: recipient.id };
   const kind = body.kind ?? (body.reply_to_id !== undefined ? "reply" : "request");
   if (!["request", "reply", "notification"].includes(kind)) throw new HttpError(400, "invalid message kind");
   const replyTo = body.reply_to_id ?? null;
@@ -1095,6 +1114,8 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
     forward: known && !live && Boolean(process.env.LEAD_WAKE_URL),
     cwd: before?.cwd ?? null,
     machine: before?.machine ?? null,
+    to_id: body.to_id,
+    resolved_from: recipient.nickname ? input.to_id : undefined,
   };
 });
 
@@ -1140,19 +1161,22 @@ async function handleSendMessage(body: SendMessageRequest) {
     forward: boolean;
     cwd: string | null;
     machine: string | null;
+    to_id: string;
+    resolved_from?: string;
   };
+  const target = { to_id: stored.to_id, ...(stored.resolved_from ? { resolved_from: stored.resolved_from } : {}) };
   if (!stored.forward) {
-    return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, ...(stored.wake ? { wake: stored.wake } : {}) };
+    return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, ...target, ...(stored.wake ? { wake: stored.wake } : {}) };
   }
   const wake = await forwardWake({
-    to_id: body.to_id,
+    to_id: stored.to_id,
     from_id: body.from_id,
     kind: stored.kind,
     message_id: stored.message_id,
     cwd: stored.cwd,
     machine: stored.machine,
   });
-  return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, wake };
+  return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, ...target, wake };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {

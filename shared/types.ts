@@ -131,6 +131,10 @@ export interface SendMessageResponse {
   duplicate?: boolean;
   error?: string;
   wake?: "sent" | "failed" | "no-route" | "unconfigured";
+  /** The peer id the message was stored for; differs from the request when a nickname was resolved. */
+  to_id?: string;
+  /** The nickname the sender used, when the broker resolved it to to_id. */
+  resolved_from?: string;
 }
 
 export interface PollMessagesRequest {

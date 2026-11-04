@@ -22,10 +22,18 @@ export async function sendPeerMessage(
   return call("/send-message", { ...body, ...metadata });
 }
 
-export function formatSendResult(toId: string, result: { message_id?: number; wake?: string }): { text: string; isError: boolean } {
-  const line = `Message sent to peer ${toId}. Message ID: ${result.message_id ?? "unavailable"}.`;
+export function formatSendResult(
+  toId: string,
+  result: { message_id?: number; wake?: string; to_id?: string; resolved_from?: string },
+): { text: string; isError: boolean } {
+  const target = result.resolved_from && result.to_id ? `${result.to_id} (nickname ${result.resolved_from})` : toId;
+  const line = `Message sent to peer ${target}. Message ID: ${result.message_id ?? "unavailable"}.`;
+  const isError = result.wake === "no-route" || result.wake === "failed";
+  const hint = isError
+    ? `\nNot delivered: no live peer has the id or nickname ${toId}, and the wake edge ${result.wake === "no-route" ? "has no route for it" : "did not answer"}. The message waits for a peer registered as ${result.to_id ?? toId} and is dropped if none claims it. Check list_peers.`
+    : "";
   return {
-    text: result.wake ? `${line}\nwake: ${result.wake}` : line,
-    isError: result.wake === "no-route" || result.wake === "failed",
+    text: result.wake ? `${line}\nwake: ${result.wake}${hint}` : line,
+    isError,
   };
 }
