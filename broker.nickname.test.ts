@@ -213,6 +213,12 @@ test("the sender's tool text names the resolved peer, and a failed wake says the
   expect(missed.isError).toBe(true);
   expect(missed.text).toContain("Not delivered");
   expect(missed.text).toContain("nobody");
+  const waiting = formatSendResult("mac-sleeper", { message_id: 11, to_id: "mac-sleeper", wake: "unconfigured" });
+  expect(waiting.isError).toBe(true);
+  expect(waiting.text).toContain("reads it when it next runs");
+  const live = formatSendResult("mac-live", { message_id: 12, to_id: "mac-live" });
+  expect(live.isError).toBe(false);
+  expect(live.text).toBe("Message sent to peer mac-live. Message ID: 12.");
 });
 
 test("a database from before this change seeds its ids before the startup sweep", async () => {

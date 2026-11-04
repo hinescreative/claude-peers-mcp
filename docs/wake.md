@@ -10,6 +10,8 @@ It calls when the recipient has no row, the row is stale, or the row's runtime i
 
 The sender sees `wake: sent`, `failed`, `no-route`, or `unconfigured` on the same response. `no-route` and `failed` are errors. A live seat has no wake line.
 
+Since PR 13 (2026-11-04) the sender's tool text treats every state but `sent` as mail that is stored and not being read now: it names the reason and says a seat registered under that id reads it when it next runs, dropped after a day if none does. On this fleet lead-wake is off by choice (10-25), so `failed` is the usual state for a seat that is not running, not breakage.
+
 The edge checks `routes.json` first. Otherwise it uses the one live thread whose `worktreePath` is under `~/.t3/worktrees/` and equals the cwd, and that thread is not a fork. Anything else is `no-route`. A broker retry sends the same T3 command id, taken from the message id.
 
 A seat with the channel disabled registers as runtime `poll`, so a send to it forwards while it is up. Codex exits when its parent process changes, the same check the Claude server already has. The next send then finds no live row and forwards.
