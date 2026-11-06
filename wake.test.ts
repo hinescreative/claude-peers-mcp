@@ -182,7 +182,7 @@ test("a poll-only seat is forwarded", async () => {
   expect(wakes.length).toBe(before + 1);
 });
 
-test("a valid unknown id is forwarded to the edge", async () => {
+test("a once-seen id that is gone is forwarded to the edge", async () => {
   const before = wakes.length;
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "no-such-seat", text: "where" });
   expect(sent.json.ok).toBe(true);
