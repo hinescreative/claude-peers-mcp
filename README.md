@@ -245,6 +245,8 @@ This separate acknowledgment history retains the most recent 4,096 IDs per
 session; ack does not clear reminder timestamps. Both histories reset on MCP
 restart. Writes already handed to a transport before ack cannot be retracted.
 
+**A live seat reads mail only between turns.** The session server writes each claimed message into the host session's inbox (`postToHostInbox` in `server.ts`, posted as a cross-session user message) and does not post it again for five minutes (`PUSH_REMINDER_MS`). Claude Code queues an injected message until the running turn ends, so a seat that holds one long turn, for example waiting on a background agent for twenty minutes, sees nothing until that turn finishes, even though the broker and the server delivered within a second. Measured on 2026-11-06: mail at 2:14 AM reached an idle seat on the first attempt; mail at 2:26 AM reached the same seat at 2:40 AM, when its turn ended (card 752). The remedy is on the seat's side: do not hold a turn waiting; hand the wait to a visible delegate or a scheduled task and end the turn.
+
 ## Running as a service
 
 ### systemd (Linux)
