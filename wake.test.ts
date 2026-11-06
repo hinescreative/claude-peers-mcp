@@ -86,7 +86,23 @@ const edge = Bun.serve({
 });
 let proc: ReturnType<typeof Bun.spawn> | null = null;
 
+// Mark an id as one the broker has seen, in whichever database a test's broker uses (see post()).
+async function seen(dbPath: string, id: string) {
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(dbPath);
+  db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) VALUES (?, ?)", [id, new Date().toISOString()]);
+  db.close();
+}
+
 async function post(path: string, body: Record<string, unknown>) {
+  // These tests model seats that registered once and are now gone. Since 2026-11-06 the broker refuses a
+  // name it has never seen, so mark a valid recipient id as seen first; "bad id" stays unseen on purpose.
+  if (path === "/send-message" && typeof body.to_id === "string" && /^[a-zA-Z0-9_-]{3,64}$/.test(body.to_id)) {
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(DB);
+    db.run("INSERT OR IGNORE INTO peer_ids_seen (id, first_seen) VALUES (?, ?)", [body.to_id, new Date().toISOString()]);
+    db.close();
+  }
   const res = await fetch(BASE + path, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
@@ -175,11 +191,11 @@ test("a valid unknown id is forwarded to the edge", async () => {
   expect(wakes.at(-1).to_id).toBe("no-such-seat");
 });
 
-test("an invalid id is stored and not forwarded", async () => {
+test("an invalid id is refused and not forwarded", async () => {
   const before = wakes.length;
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "bad id", text: "nope" });
-  expect(sent.json.ok).toBe(true);
-  expect(sent.json.wake).toBe("no-route");
+  expect(sent.status).toBe(404);
+  expect(sent.json.error).toContain("no peer named");
   expect(wakes.length).toBe(before);
 });
 
@@ -243,6 +259,7 @@ test("a dead local pid with a fresh heartbeat is forwarded, using the saved cwd"
 test("codex-direct ask prints the wake line and does not wait after no-route", async () => {
   edgeMode = "no-route";
   const started = Date.now();
+  await seen(DB, "ask-target");
   const child = Bun.spawn(["bun", "codex-direct.ts", "ask", "ask-target", "hello", "--seconds", "30"], {
     cwd: import.meta.dir,
     env: {
@@ -294,6 +311,7 @@ test("an unset lead-wake url is unconfigured and does not call the edge", async 
     });
     expect(reg.ok).toBe(true);
     const before = wakes.length;
+    await seen(db, "off-target");
     const res = await fetch(`http://127.0.0.1:${port}/send-message`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer test-token" },
@@ -440,6 +458,7 @@ test("the outbound bearer is the first tokens-file line when the env token is un
     });
     expect(reg.ok).toBe(true);
     const before = wakes.length;
+    await seen(`/tmp/claude-peers-wake-token-${process.pid}.db`, "token-target");
     const res = await fetch(`http://127.0.0.1:${port}/send-message`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer file-token" },

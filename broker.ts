@@ -454,7 +454,9 @@ function resolveRecipient(toId: string): { id: string; nickname?: string } {
   if (matches.length > 1) {
     throw new HttpError(409, `nickname "${trimmed}" names ${matches.length} peers (${matches.map((m) => m.id).join(", ")}); send to one peer id`);
   }
-  return { id: trimmed };
+  // 2026-11-06 (Wes, after a brief to a swept seat's nickname sat unclaimable): a name that is not a registered
+  // peer, not an id this broker has ever seen, and not one live nickname is refused here, so the sender knows at once.
+  throw new HttpError(404, `no peer named "${trimmed}": nobody is registered under that id or nickname; send to the seat's id (list_peers shows ids)`);
 }
 const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ?");
 
