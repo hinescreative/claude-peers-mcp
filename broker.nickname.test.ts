@@ -191,17 +191,14 @@ test("a nickname whose seat has gone stale is forwarded to lead-wake under the s
   expect(wakes.at(-1).message_id).toBe(sent.json.message_id);
 });
 
-test("a name nobody holds is still stored for a later registration and offered to lead-wake unchanged", async () => {
+test("a name nobody holds is refused at once and nothing is stored", async () => {
   const before = wakes.length;
   const sent = await post("/send-message", { from_id: "mac-sender", to_id: "nobody-here", text: "hello?" });
-  expect(sent.status).toBe(200);
-  expect(sent.json.to_id).toBe("nobody-here");
-  expect(sent.json.resolved_from).toBeUndefined();
-  expect(sent.json.wake).toBe("sent");
-  expect(wakes.at(-1).to_id).toBe("nobody-here");
-  expect(wakes.length).toBe(before + 1);
+  expect(sent.status).toBe(404);
+  expect(sent.json.error).toContain("no peer named \"nobody-here\"");
+  expect(wakes.length).toBe(before);
   expect((await post("/register", seat("nobody-here"))).status).toBe(200);
-  expect((await inbox("nobody-here")).map((m) => m.text)).toEqual(["hello?"]);
+  expect(await inbox("nobody-here")).toEqual([]);
 });
 
 test("the sender's tool text names the resolved peer, and a failed wake says the mail did not land", async () => {
