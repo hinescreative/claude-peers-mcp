@@ -1,0 +1,153 @@
+{
+  "moves": [],
+  "unchanged": [
+    {
+      "path": ".gitignore",
+      "phase": 0
+    },
+    {
+      "path": ".gitleaks.toml",
+      "phase": 0
+    },
+    {
+      "path": ".mcp.json",
+      "phase": 0
+    },
+    {
+      "path": "broker.auth.test.ts",
+      "phase": 0
+    },
+    {
+      "path": "broker.delivery-protocol.test.ts",
+      "phase": 0
+    },
+    {
+      "path": "broker.nickname.test.ts",
+      "phase": 0
+    },
+    {
+      "path": "broker.process-table.test.ts",
+      "phase": 0
+    },
+    {
+      "path": "broker.ts",
+      "phase": 0
+    },
+    {
+      "path": "bun.lock",
+      "phase": 0
+    },
+    {
+      "path": "butler-inbox-edge.test.ts",
+      "phase": 0
+    },
+    {
+      "path": "butler-inbox-edge.ts",
+      "phase": 0
+    },
+    {
+      "path": "CLAUDE.md",
+      "phase": 0
+    },
+    {
+      "path": "cli.ts",
+      "phase": 0
+    },
+    {
+      "path": "codex-direct.ts",
+      "phase": 0
+    },
+    {
+      "path": "codex-server.ts",
+      "phase": 0
+    },
+    {
+      "path": "dashboard",
+      "phase": 0
+    },
+    {
+      "path": "dashboard-server.ts",
+      "phase": 0
+    },
+    {
+      "path": "dispatch.mjs",
+      "phase": 0
+    },
+    {
+      "path": "docs",
+      "phase": 0
+    },
+    {
+      "path": "grok-edge.md",
+      "phase": 0
+    },
+    {
+      "path": "grok-edge.ts",
+      "phase": 0
+    },
+    {
+      "path": "INDEX.json",
+      "phase": 0
+    },
+    {
+      "path": "index.ts",
+      "phase": 0
+    },
+    {
+      "path": "lead-wake-edge.ts",
+      "phase": 0
+    },
+    {
+      "path": "LICENSE",
+      "phase": 0
+    },
+    {
+      "path": "package.json",
+      "phase": 0
+    },
+    {
+      "path": "pins.test.ts",
+      "phase": 0
+    },
+    {
+      "path": "protocol.mjs",
+      "phase": 0
+    },
+    {
+      "path": "README.md",
+      "phase": 0
+    },
+    {
+      "path": "scripts",
+      "phase": 0
+    },
+    {
+      "path": "server.delivery-protocol.integration.test.ts",
+      "phase": 0
+    },
+    {
+      "path": "server.ts",
+      "phase": 0
+    },
+    {
+      "path": "shared",
+      "phase": 0
+    },
+    {
+      "path": "systemd",
+      "phase": 0
+    },
+    {
+      "path": "tools",
+      "phase": 0
+    },
+    {
+      "path": "tsconfig.json",
+      "phase": 0
+    },
+    {
+      "path": "wake.test.ts",
+      "phase": 0
+    }
+  ]
+}

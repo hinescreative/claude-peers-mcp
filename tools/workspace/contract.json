@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "kinds": [
+    "startup",
+    "docs",
+    "source",
+    "site",
+    "tools",
+    "config",
+    "data",
+    "records",
+    "notes",
+    "research",
+    "checks",
+    "tests",
+    "assets",
+    "archive",
+    "seat",
+    "client-work"
+  ],
+  "sensitivity": [
+    "standard",
+    "customer-data",
+    "secrets",
+    "mixed"
+  ],
+  "required_categories": [],
+  "cover_all_directories": false,
+  "cover_root_files": true,
+  "skip": [
+    ".git",
+    "node_modules",
+    "dist",
+    "__pycache__",
+    ".wrangler",
+    ".astro",
+    ".worktrees",
+    ".venv",
+    ".next"
+  ],
+  "worker_roots_skip": [],
+  "required_owners": [],
+  "phase": 0
+}

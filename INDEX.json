@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "default_owner": {
+    "seat": "foreman"
+  },
+  "entries": [
+    {
+      "path": "CLAUDE.md",
+      "kind": "startup",
+      "purpose": "The rules for working in the repo: what each main file is, use Bun, how restarting the broker affects live sessions, and never commit tokens.",
+      "sensitivity": "standard",
+      "group": [
+        "CLAUDE.md",
+        "README.md",
+        "LICENSE"
+      ]
+    },
+    {
+      "path": ".gitleaks.toml",
+      "kind": "checks",
+      "purpose": "The secret-scanner rules that refuse fleet-specific values from being committed, used by the pre-commit script.",
+      "sensitivity": "mixed"
+    },
+    {
+      "path": "broker.auth.test.ts",
+      "kind": "tests",
+      "purpose": "Bun tests for the broker, delivery protocol, nicknames, process table, pins, the edges, server integration and wake behavior.",
+      "sensitivity": "standard",
+      "group": [
+        "broker.auth.test.ts",
+        "broker.delivery-protocol.test.ts",
+        "broker.nickname.test.ts",
+        "broker.process-table.test.ts",
+        "butler-inbox-edge.test.ts",
+        "pins.test.ts",
+        "server.delivery-protocol.integration.test.ts",
+        "wake.test.ts"
+      ]
+    },
+    {
+      "path": "broker.ts",
+      "kind": "source",
+      "purpose": "The broker, an HTTP daemon with a SQLite store that tracks peers and holds and delivers messages.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "dashboard",
+      "kind": "site",
+      "purpose": "The dashboard front end that shows peers and messages, with a README.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "dashboard-server.ts",
+      "kind": "source",
+      "purpose": "The small server that serves the dashboard and its data.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "docs",
+      "kind": "docs",
+      "purpose": "The broker contract and the description of how a message wakes an off-line lead.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "grok-edge.md",
+      "kind": "docs",
+      "purpose": "How the Grok edge works, the three tools it exposes and how to run it.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "grok-edge.ts",
+      "kind": "source",
+      "purpose": "The bridges that give seats which cannot run the MCP an identity: the Grok edge, the butler inbox edge, and the lead-wake edge with its dispatch and routing rules.",
+      "sensitivity": "standard",
+      "group": [
+        "grok-edge.ts",
+        "butler-inbox-edge.ts",
+        "lead-wake-edge.ts",
+        "dispatch.mjs",
+        "protocol.mjs"
+      ]
+    },
+    {
+      "path": "INDEX.json",
+      "kind": "startup",
+      "purpose": "This map: what each top-level path in the folder is for and who owns it.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "package.json",
+      "kind": "config",
+      "purpose": "Package, TypeScript and Bun lock files, the MCP launch config for the repo, and the ignore rules.",
+      "sensitivity": "standard",
+      "group": [
+        "package.json",
+        "tsconfig.json",
+        "bun.lock",
+        ".mcp.json",
+        ".gitignore"
+      ]
+    },
+    {
+      "path": "scripts",
+      "kind": "tools",
+      "purpose": "Pre-commit secret scanning with gitleaks rules, and launchers for the Cloudflare tunnel and the dashboard.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "server.ts",
+      "kind": "source",
+      "purpose": "The per-session MCP server that registers a Claude session with the broker and delivers messages, with its Codex variants, entry file and command-line inspector.",
+      "sensitivity": "standard",
+      "group": [
+        "server.ts",
+        "index.ts",
+        "codex-server.ts",
+        "codex-direct.ts",
+        "cli.ts"
+      ]
+    },
+    {
+      "path": "shared",
+      "kind": "source",
+      "purpose": "Code shared by the servers: the message contract, pinned peer ids, summary generation and broker types.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "systemd",
+      "kind": "config",
+      "purpose": "The systemd unit that keeps the butler inbox edge running on its host.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "tools",
+      "kind": "tools",
+      "purpose": "Holds tools/workspace, the data files the central house checkers read for this folder.",
+      "sensitivity": "standard"
+    },
+    {
+      "path": "tools/workspace",
+      "kind": "tools",
+      "purpose": "Data files the central house checkers read for this folder: the contract, the list of top-level items, the ignore probes and the outside readers. The checker programs themselves live in hinescreative/house-migration.",
+      "sensitivity": "standard"
+    }
+  ]
+}

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "name": "Session start",
+      "kind": "session-start",
+      "where": "any agent session opened in this folder",
+      "reads": [
+        "CLAUDE.md",
+        "README.md"
+      ],
+      "checks": [],
+      "state": "left",
+      "reason": "Map only: these files stayed where they are."
+    },
+    {
+      "name": "Butler inbox edge unit",
+      "kind": "service",
+      "where": "systemd user service on the broker host",
+      "reads": [
+        "systemd/claude-peers-butler-inbox.service",
+        "butler-inbox-edge.ts"
+      ],
+      "checks": [],
+      "state": "left",
+      "reason": "Map only: nothing in this folder has moved, so this reader was left as written."
+    },
+    {
+      "name": "Broker and MCP servers",
+      "kind": "service",
+      "where": "Run with bun; the broker as the claude-peers-broker user service, the MCP server launched by each Claude session",
+      "reads": [
+        "broker.ts",
+        "server.ts",
+        "codex-server.ts",
+        ".mcp.json"
+      ],
+      "checks": [],
+      "state": "left",
+      "reason": "Map only: nothing in this folder has moved, so this reader was left as written."
+    },
+    {
+      "name": "Dashboard and tunnel launchers",
+      "kind": "script",
+      "where": "launchd or by hand on the Mac",
+      "reads": [
+        "scripts/run-dashboard.zsh",
+        "scripts/run-cloudflared.zsh",
+        "dashboard-server.ts",
+        "dashboard"
+      ],
+      "checks": [],
+      "state": "left",
+      "reason": "Map only: nothing in this folder has moved, so this reader was left as written."
+    },
+    {
+      "name": "Shared types",
+      "kind": "package",
+      "where": "Imported by other peers tooling",
+      "reads": [
+        "shared"
+      ],
+      "checks": [],
+      "state": "left",
+      "reason": "Map only: nothing in this folder has moved, so this reader was left as written."
+    },
+    {
+      "name": "startup-file: ~/.codex/config.toml:180",
+      "kind": "startup-file",
+      "machine": "m3",
+      "where": "~/.codex/config.toml:180",
+      "reads": [],
+      "checks": [
+        {
+          "op": "repo-exists",
+          "path": "INDEX.json"
+        }
+      ],
+      "runs_now": true,
+      "state": "left",
+      "reason": "Map only: nothing in this folder has moved, so this reader was left as written. It names the folder itself, or a file that is not tracked in git, so the check is only that the folder and its map are there."
+    }
+  ]
+}
