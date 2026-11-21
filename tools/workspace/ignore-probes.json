@@ -1,0 +1,14 @@
+{
+  "source": [
+    ".DS_Store",
+    ".env",
+    ".env.local",
+    "node_modules/probe"
+  ],
+  "destination": [
+    ".DS_Store",
+    ".env",
+    ".env.local",
+    "node_modules/probe"
+  ]
+}
