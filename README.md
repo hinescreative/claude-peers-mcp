@@ -362,3 +362,14 @@ chmod +x "$hooks/pre-commit"
 ## Credits
 
 Forked from [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp). Original: single-machine peer discovery via localhost broker. This fork adds fleet-wide federation, token authentication, machine-aware peer tracking, and cross-machine message routing.
+
+## House conventions (Hines fleet)
+
+Moved here from `~/AGENTS.md` on the one-page switch (card 1461); also in `~/hines/setup/runbooks/links-and-comms.md`.
+
+- Every deliberate seat has an identity on the broker at theoldone:7899 (dashboard http://100.108.57.10:8799).
+- A seat that can run the `claude-peers` MCP registers itself: Claude is `mac-<project>-no-tty` (plus an instance suffix when two share a folder), Grok is `mac-<project>-grok`, Kimi is `mac-<project>-kimi`, Codex via codex-server.
+- A seat that cannot run the MCP (Cursor, a bot in someone else's cloud, a script) gets a hosted edge on theoldone, like the four Grok edges: the edge holds the id, inbox and heartbeat; the seat reaches it over HTTP. Do not build a new transport or registry for a new seat; add an edge.
+- Inside T3, thread-to-thread talk uses T3 thread send (it carries provenance); peers is for anything outside T3 or on another machine.
+- Lifecycle: `check_messages`, reply with `send_message` (kind=reply, reply_to_id), confirm with `ack_message`. Doorbell file `~/.claude-peers/doorbell/<peer-id>.log` (monitor `^PEER `). `peers send --from <your-id>` from a shell; the bare `cli` sender cannot receive replies.
+- Grok Bots: any seat on peers can hand work straight to Wes's Grok Bots through `grok_bot_peers`, sent as `kind=request` (`~/hines/assistant-claude/projects/grok-bots/FOR-LEADS.md`).
