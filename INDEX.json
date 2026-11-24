@@ -32,6 +32,7 @@
         "broker.nickname.test.ts",
         "broker.process-table.test.ts",
         "butler-inbox-edge.test.ts",
+        "duet-edge.test.ts",
         "pins.test.ts",
         "server.delivery-protocol.integration.test.ts",
         "wake.test.ts"
@@ -62,6 +63,12 @@
       "sensitivity": "standard"
     },
     {
+      "path": "duet-edge.md",
+      "kind": "docs",
+      "purpose": "How the Claude Duet edge works: its four signed calls, the recipient allowlist, request signing, its own broker token and how to run it.",
+      "sensitivity": "standard"
+    },
+    {
       "path": "grok-edge.md",
       "kind": "docs",
       "purpose": "How the Grok edge works, the three tools it exposes and how to run it.",
@@ -70,11 +77,12 @@
     {
       "path": "grok-edge.ts",
       "kind": "source",
-      "purpose": "The bridges that give seats which cannot run the MCP an identity: the Grok edge, the butler inbox edge, and the lead-wake edge with its dispatch and routing rules.",
+      "purpose": "The bridges that give seats which cannot run the MCP an identity: the Grok edge, the butler inbox edge, the Claude Duet edge, and the lead-wake edge with its dispatch and routing rules.",
       "sensitivity": "standard",
       "group": [
         "grok-edge.ts",
         "butler-inbox-edge.ts",
+        "duet-edge.ts",
         "lead-wake-edge.ts",
         "dispatch.mjs",
         "protocol.mjs"
@@ -127,7 +135,7 @@
     {
       "path": "systemd",
       "kind": "config",
-      "purpose": "The systemd unit that keeps the butler inbox edge running on its host.",
+      "purpose": "The systemd units that keep the butler inbox edge and the Claude Duet edge running on their host.",
       "sensitivity": "standard"
     },
     {
