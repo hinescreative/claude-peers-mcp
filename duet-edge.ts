@@ -23,7 +23,7 @@
  *   DUET_PEER_MACHINE        default duet
  *   DUET_PEER_SUMMARY        optional register summary override
  *   DUET_EDGE_HOST           default 127.0.0.1
- *   DUET_EDGE_PORT           default 8804
+ *   DUET_EDGE_PORT           default 8805
  *   DUET_EDGE_STATE          default ~/.local/state/duet-edge
  *   DUET_SEND_PER_MINUTE     default 20
  */
@@ -335,7 +335,7 @@ export function configFromEnv(env: Record<string, string | undefined>): EdgeConf
     summary: env.DUET_PEER_SUMMARY?.trim()
       || `${nickname}, the person's chief of staff app. Mail waits in its inbox until it next checks, so a reply is not instant.`,
     host: env.DUET_EDGE_HOST?.trim() || "127.0.0.1",
-    port: Number(env.DUET_EDGE_PORT ?? 8804),
+    port: Number(env.DUET_EDGE_PORT ?? 8805),
     state: env.DUET_EDGE_STATE?.trim() || join(env.HOME ?? ".", ".local/state/duet-edge"),
   };
 }
@@ -360,4 +360,7 @@ export async function start() {
   }
 }
 
-if (import.meta.main) start().catch((e) => { log(`fatal: ${e instanceof BrokerError || /required|must/.test(String(e?.message)) ? e.message : "startup error (check broker access and lease state)"}`); process.exit(1); });
+// A taken port says so; another loopback edge once held the default and this read as a broker fault.
+const fatalMessage = (e: any) => e?.code === "EADDRINUSE" ? `port ${e?.port ?? process.env.DUET_EDGE_PORT ?? 8805} is in use by another program (set DUET_EDGE_PORT)`
+  : e instanceof BrokerError || /required|must/.test(String(e?.message)) ? e.message : "startup error (check broker access and lease state)";
+if (import.meta.main) start().catch((e) => { log(`fatal: ${fatalMessage(e)}`); process.exit(1); });

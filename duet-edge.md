@@ -6,7 +6,7 @@ The OAuth part lives in a small Cloudflare Worker (kept in the operator's
 private repo). This edge is the half that talks to the broker.
 
 ```
-Claude Duet ──OAuth──▶ connector Worker ──HMAC-signed HTTPS──▶ tunnel ──▶ 127.0.0.1:8804 duet-edge.ts ──▶ broker
+Claude Duet ──OAuth──▶ connector Worker ──HMAC-signed HTTPS──▶ tunnel ──▶ 127.0.0.1:8805 duet-edge.ts ──▶ broker
 ```
 
 The broker port is never exposed. The Worker holds no broker token; the edge
@@ -72,7 +72,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now claude-peers-duet-edge.service
 ```
 
-Point a tunnel hostname at `http://127.0.0.1:8804`, never at the broker. Do not
+Point a tunnel hostname at `http://127.0.0.1:8805`, never at the broker. Do not
 print the tokens or the secret.
 
 ## Seat
