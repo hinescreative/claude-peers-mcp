@@ -1,5 +1,5 @@
 [Unit]
-Description=claude-peers edge for Claude Duet (loopback :8804, reached through the duet tunnel)
+Description=claude-peers edge for Claude Duet (loopback :8805, reached through the duet tunnel)
 After=network-online.target claude-peers-broker.service
 Wants=network-online.target
 Requires=claude-peers-broker.service

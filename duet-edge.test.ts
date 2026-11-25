@@ -56,7 +56,7 @@ function setup(over: Partial<EdgeConfig> = {}, peers: any[] = []) {
     const raw = JSON.stringify(body);
     const ts = String(Math.floor((opts.ts ?? clock) / 1000));
     const nonce = opts.nonce ?? `nonce-${String(++n).padStart(12, "0")}`;
-    return new Request(`http://127.0.0.1:8804${path}`, {
+    return new Request(`http://127.0.0.1:8805${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json", "X-Duet-Ts": ts, "X-Duet-Nonce": nonce,
@@ -81,8 +81,8 @@ test("signature: only a fresh, correctly signed request for this path is accepte
   const tampered = new Request(req.url, { method: "POST", headers: req.headers, body: JSON.stringify({ message_ids: [2] }) });
   expect((await e.handle(tampered)).status).toBe(401);
   // Unsigned and bearer-only requests fail.
-  expect((await e.handle(new Request("http://127.0.0.1:8804/v1/inbox", { method: "POST", body: "{}" }))).status).toBe(401);
-  expect((await e.handle(new Request("http://127.0.0.1:8804/v1/inbox", { method: "POST", headers: { Authorization: `Bearer ${SECRET}` }, body: "{}" }))).status).toBe(401);
+  expect((await e.handle(new Request("http://127.0.0.1:8805/v1/inbox", { method: "POST", body: "{}" }))).status).toBe(401);
+  expect((await e.handle(new Request("http://127.0.0.1:8805/v1/inbox", { method: "POST", headers: { Authorization: `Bearer ${SECRET}` }, body: "{}" }))).status).toBe(401);
 });
 
 test("signature: a nonce works once, and the record survives a restart", async () => {
@@ -100,10 +100,10 @@ test("signature: a nonce works once, and the record survives a restart", async (
 
 test("routes: health says only ok, unknown paths 404, GET on a route 405, big bodies 413", async () => {
   const e = setup();
-  const health = await e.handle(new Request("http://127.0.0.1:8804/health"));
+  const health = await e.handle(new Request("http://127.0.0.1:8805/health"));
   expect(await health.json()).toEqual({ status: "ok" });
-  expect((await e.handle(new Request("http://127.0.0.1:8804/mcp", { method: "POST", body: "{}" }))).status).toBe(404);
-  expect((await e.handle(new Request("http://127.0.0.1:8804/v1/inbox"))).status).toBe(405);
+  expect((await e.handle(new Request("http://127.0.0.1:8805/mcp", { method: "POST", body: "{}" }))).status).toBe(404);
+  expect((await e.handle(new Request("http://127.0.0.1:8805/v1/inbox"))).status).toBe(405);
   const big = e.signed("/v1/send", { to_id: "alice-seat", message: "x".repeat(70_000) });
   expect((await e.handle(big)).status).toBe(413);
 });
@@ -216,7 +216,7 @@ test("broker failures: 4xx text is passed on, an outage is a plain 502", async (
 test("config: required values, secret length, allowlist ids", () => {
   const base = { CLAUDE_PEERS_BROKER_URL: "http://127.0.0.1:1", CLAUDE_PEERS_TOKEN: "t", DUET_EDGE_SECRET: SECRET, HOME: "/tmp/h" };
   const c = configFromEnv({ ...base, DUET_PEER_ALLOWLIST: " a-seat, b_seat ,," });
-  expect(c).toMatchObject({ peerId: "duet", host: "127.0.0.1", port: 8804, allowlist: ["a-seat", "b_seat"], state: "/tmp/h/.local/state/duet-edge" });
+  expect(c).toMatchObject({ peerId: "duet", host: "127.0.0.1", port: 8805, allowlist: ["a-seat", "b_seat"], state: "/tmp/h/.local/state/duet-edge" });
   expect(() => configFromEnv({ ...base, CLAUDE_PEERS_BROKER_URL: "" })).toThrow("CLAUDE_PEERS_BROKER_URL is required");
   expect(() => configFromEnv({ ...base, DUET_EDGE_SECRET: "short" })).toThrow("at least 32");
   expect(() => configFromEnv({ ...base, DUET_PEER_ALLOWLIST: "ok-seat,bad id" })).toThrow("not a peer id");
