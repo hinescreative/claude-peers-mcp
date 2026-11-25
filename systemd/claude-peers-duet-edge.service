@@ -1,0 +1,22 @@
+[Unit]
+Description=claude-peers edge for Claude Duet (loopback :8804, reached through the duet tunnel)
+After=network-online.target claude-peers-broker.service
+Wants=network-online.target
+Requires=claude-peers-broker.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/mcp-servers/claude-peers-mcp
+# Mode 600. Holds CLAUDE_PEERS_BROKER_URL, this edge's own CLAUDE_PEERS_TOKEN,
+# DUET_EDGE_SECRET and DUET_PEER_ALLOWLIST. See duet-edge.md.
+EnvironmentFile=%h/.local/state/duet-edge/edge.env
+ExecStart=%h/.bun/bin/bun %h/mcp-servers/claude-peers-mcp/duet-edge.ts
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

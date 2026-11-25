@@ -26,6 +26,18 @@
       "reason": "Map only: nothing in this folder has moved, so this reader was left as written."
     },
     {
+      "name": "Duet edge unit",
+      "kind": "service",
+      "where": "systemd user service on the broker host",
+      "reads": [
+        "systemd/claude-peers-duet-edge.service",
+        "duet-edge.ts"
+      ],
+      "checks": [],
+      "state": "left",
+      "reason": "New reader: the Claude Duet edge."
+    },
+    {
       "name": "Broker and MCP servers",
       "kind": "service",
       "where": "Run with bun; the broker as the claude-peers-broker user service, the MCP server launched by each Claude session",
